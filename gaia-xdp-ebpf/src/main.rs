@@ -1,77 +1,71 @@
 #![no_std]
 #![no_main]
 
-use core::{mem, net::Ipv4Addr};
+#[allow(
+    clippy::all,
+    dead_code,
+    improper_ctypes_definitions,
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    unnecessary_transmutes,
+    unsafe_op_in_unsafe_fn,
+)]
+#[rustfmt::skip]
+mod vmlinux;
+
+use crate::vmlinux::{sock, sock_common};
 
 use aya_ebpf::{
-    bindings::xdp_action,
-    macros::{map, xdp},
-    maps::HashMap,
-    programs::XdpContext,
+    helpers::bpf_probe_read_kernel, macros::kprobe, programs::ProbeContext,
 };
 use aya_log_ebpf::info;
-use network_types::{
-    eth::{EthHdr, EtherType},
-    ip::{IpProto, Ipv4Hdr},
-    tcp::TcpHdr,
-    udp::UdpHdr,
-};
 
-#[xdp]
-pub fn gaia_xdp(ctx: XdpContext) -> u32 {
-    match try_gaia_xdp(ctx) {
+const AF_INET: u16 = 2;
+const AF_INET6: u16 = 10;
+
+#[kprobe]
+pub fn kprobetcp(ctx: ProbeContext) -> u32 {
+    match try_kprobetcp(ctx) {
         Ok(ret) => ret,
-        Err(_) => xdp_action::XDP_ABORTED,
+        Err(ret) => ret.try_into().unwrap_or(1),
     }
 }
 
-#[map]
-static BLOCKLIST: HashMap<u32, u32> = HashMap::<u32, u32>::with_max_entries(1024, 0);
-
-#[inline(always)]
-fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
-    let start = ctx.data();
-    let end = ctx.data_end();
-    let len = mem::size_of::<T>();
-    if start + offset + len > end {
-        return Err(());
-    }
-    Ok((start + offset) as *const T)
-}
-
-fn block_ip(address: u32) -> bool {
-    unsafe { BLOCKLIST.get(&address).is_some() }
-}
-
-fn try_gaia_xdp(ctx: XdpContext) -> Result<u32, ()> {
-    let ethhdr: *const EthHdr = ptr_at(&ctx, 0)?;
-    match unsafe { (*ethhdr).ether_type() } {
-        Ok(EtherType::Ipv4) => {}
-        _ => return Ok(xdp_action::XDP_PASS),
-    }
-    let ipv4hdr: *const Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN)?;
-    let source_addr = u32::from_be_bytes(unsafe { (*ipv4hdr).src_addr });
-    let source_port = match unsafe { (*ipv4hdr).proto } {
-        IpProto::Tcp => {
-            let tcphdr: *const TcpHdr = ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
-            u16::from_be_bytes(unsafe { (*tcphdr).source })
+fn try_kprobetcp(ctx: ProbeContext) -> Result<u32, i64> {
+    let sock: *mut sock = ctx.arg(0).ok_or(1i64)?;
+    let sk_common = unsafe {
+        bpf_probe_read_kernel(&(*sock).__sk_common as *const sock_common)
+    }?;
+    match sk_common.skc_family {
+        AF_INET => {
+            let src_addr = u32::from_be(unsafe {
+                sk_common.__bindgen_anon_1.__bindgen_anon_1.skc_rcv_saddr
+            });
+            let dest_addr: u32 = u32::from_be(unsafe {
+                sk_common.__bindgen_anon_1.__bindgen_anon_1.skc_daddr
+            });
+            info!(
+                &ctx,
+                "AF_INET src address: {:i}, dest address: {:i}",
+                src_addr,
+                dest_addr,
+            );
+            Ok(0)
         }
-        IpProto::Udp => {
-            let udphdr: *const UdpHdr = ptr_at(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
-            unsafe { (*udphdr).src_port() }
+        AF_INET6 => {
+            let src_addr = sk_common.skc_v6_rcv_saddr;
+            let dest_addr = sk_common.skc_v6_daddr;
+            info!(
+                &ctx,
+                "AF_INET6 src addr: {:i}, dest addr: {:i}",
+                unsafe { src_addr.in6_u.u6_addr8 },
+                unsafe { dest_addr.in6_u.u6_addr8 }
+            );
+            Ok(0)
         }
-        _ => return Err(()),
-    };
-    
-    let action = if block_ip(source_addr) {
-        xdp_action::XDP_DROP
-    } else {
-        xdp_action::XDP_PASS
-    };
-if source_addr != Ipv4Addr::new(192, 168, 10, 106).into() {
-        info!(&ctx, "SRC IP: {:i}, SRC PORT: {}, ACTION: {}", source_addr, source_port,action);
+        _ => Ok(0),
     }
-    Ok(action)
 }
 
 #[cfg(not(test))]
@@ -79,7 +73,3 @@ if source_addr != Ipv4Addr::new(192, 168, 10, 106).into() {
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
-
-#[unsafe(link_section = "license")]
-#[unsafe(no_mangle)]
-static LICENSE: [u8; 13] = *b"Dual MIT/GPL\0";
