@@ -10,6 +10,13 @@
   align-items: start;
 }
 
+.hero-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
 .badge {
   display: inline-flex;
   padding: 4px 10px;
@@ -19,6 +26,21 @@
   font-size: 13px;
   letter-spacing: 0.04em;
   text-transform: uppercase;
+}
+
+.lang-switch {
+  border: 1px solid rgba(6, 44, 51, 0.24);
+  background: rgba(255, 255, 255, 0.9);
+  color: #0b7285;
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.lang-switch:hover {
+  background: rgba(11, 114, 133, 0.08);
 }
 
 .intro {
