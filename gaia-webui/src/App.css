@@ -1,0 +1,171 @@
+.gaia {
+  display: grid;
+  gap: 20px;
+}
+
+.hero {
+  display: grid;
+  grid-template-columns: 1fr 280px;
+  gap: 18px;
+  align-items: start;
+}
+
+.badge {
+  display: inline-flex;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(17, 138, 178, 0.15);
+  color: #0b7285;
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.intro {
+  max-width: 66ch;
+}
+
+.status-box {
+  padding: 14px;
+  border-radius: 14px;
+  background: rgba(4, 29, 34, 0.78);
+  color: #f4fbff;
+  display: grid;
+  gap: 6px;
+}
+
+.status-box p,
+.status-box span {
+  margin: 0;
+  color: #b8d8e0;
+}
+
+.grid {
+  display: grid;
+  gap: 12px;
+}
+
+.stats {
+  grid-template-columns: repeat(3, minmax(120px, 1fr));
+}
+
+.stats article {
+  background: rgba(255, 255, 255, 0.84);
+  border-radius: 12px;
+  border: 1px solid rgba(6, 44, 51, 0.12);
+  padding: 12px;
+}
+
+.stats p,
+.stats h2 {
+  margin: 0;
+}
+
+.panel {
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid rgba(6, 44, 51, 0.12);
+  border-radius: 14px;
+  padding: 14px;
+}
+
+.panel h3 {
+  margin: 0 0 12px;
+}
+
+.feature-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.feature {
+  padding: 10px 12px;
+  border-radius: 10px;
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 14px;
+}
+
+.feature.ok {
+  background: rgba(6, 130, 109, 0.12);
+}
+
+.feature.down {
+  background: rgba(176, 59, 47, 0.14);
+}
+
+.two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.services {
+  display: grid;
+  gap: 8px;
+}
+
+.service-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  border-bottom: 1px dashed rgba(6, 44, 51, 0.15);
+  padding-bottom: 8px;
+}
+
+.service-row:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.alerts {
+  display: grid;
+  gap: 8px;
+}
+
+.alert {
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+
+.alert p,
+.alert span {
+  margin: 0;
+}
+
+.alert.medium {
+  background: rgba(208, 158, 51, 0.16);
+}
+
+.alert.high {
+  background: rgba(188, 94, 44, 0.16);
+}
+
+.alert.critical {
+  background: rgba(162, 42, 30, 0.22);
+}
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+th,
+td {
+  text-align: left;
+  border-bottom: 1px solid rgba(6, 44, 51, 0.12);
+  padding: 8px;
+}
+
+@media (max-width: 920px) {
+  .hero,
+  .stats,
+  .feature-list,
+  .two {
+    grid-template-columns: 1fr;
+  }
+}

@@ -1,0 +1,16 @@
+sensitive_prefixes = ["/etc/shadow", "/etc/ssl", "/root/.ssh", "/var/lib/gaia"]
+monitored_services = ["sshd.service", "nginx.service"]
+exec_whitelist_prefixes = ["/usr/bin", "/usr/sbin", "/bin", "/sbin"]
+blocked_ports = [4444, 31337]
+
+[baseline_thresholds]
+file_io = 200
+process = 80
+privilege = 20
+network = 160
+hotpatch = 50
+
+# Uncomment and adjust to attach uprobe/uretprobe hot-patches:
+# [[hotpatch.targets]]
+# binary = "/usr/sbin/nginx"
+# symbol = "ngx_http_process_request"
