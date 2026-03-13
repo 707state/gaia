@@ -10,6 +10,13 @@ privilege = 20
 network = 160
 hotpatch = 50
 
+# IP rate limiting rules
+# [[rate_limit_rules]]
+# cidr = "10.0.0.0/8"
+# max_conn_per_sec = 100
+# action = "log"
+# enabled = true
+
 # Uncomment and adjust to attach uprobe/uretprobe hot-patches:
 # [[hotpatch.targets]]
 # binary = "/usr/sbin/nginx"

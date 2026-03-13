@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     fs,
     mem::size_of,
+    net::Ipv4Addr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -11,18 +12,19 @@ use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
     extract::State,
-    http::{HeaderValue, Method},
+    http::{HeaderValue, Method, header},
     routing::get,
 };
 use aya::{
     Ebpf,
-    maps::{HashMap as BpfHashMap, MapData, ring_buf::RingBuf},
+    maps::{Array as BpfArray, HashMap as BpfHashMap, MapData, ring_buf::RingBuf},
     programs::{KProbe, TracePoint, UProbe},
 };
 use clap::Parser;
 use gaia_xdp_common::{
-    EVENT_ACTION_ALERT, EVENT_ACTION_BLOCKED, EVENT_KIND_FILE_IO, EVENT_KIND_HOTPATCH,
-    EVENT_KIND_NETWORK, EVENT_KIND_PRIVILEGE, EVENT_KIND_PROCESS, KernelEvent,
+    EVENT_ACTION_ALERT, EVENT_ACTION_BLOCKED, EVENT_ACTION_RATE_LIMITED,
+    EVENT_KIND_FILE_IO, EVENT_KIND_HOTPATCH, EVENT_KIND_NETWORK, EVENT_KIND_PRIVILEGE,
+    EVENT_KIND_PROCESS, HotpatchPidEntry, KernelEvent, RateLimitEntry,
 };
 use log::{info, warn};
 use object::{Object, ObjectSymbol};
@@ -53,7 +55,7 @@ struct Opt {
 
 // ── Policy config (YAML / TOML) ──
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct MonitorPolicy {
     #[serde(default)]
     sensitive_prefixes: Vec<String>,
@@ -67,20 +69,41 @@ struct MonitorPolicy {
     baseline_thresholds: HashMap<String, u32>,
     #[serde(default)]
     hotpatch: HotpatchPolicy,
+    #[serde(default)]
+    rate_limit_rules: Vec<RateLimitRule>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 struct HotpatchPolicy {
     #[serde(default)]
     targets: Vec<HotpatchTarget>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct HotpatchTarget {
     binary: String,
     symbol: String,
     #[serde(default)]
     pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct RateLimitRule {
+    cidr: String,
+    max_conn_per_sec: u32,
+    #[serde(default)]
+    action: RateLimitAction,
+    #[serde(default)]
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum RateLimitAction {
+    #[default]
+    Log,
+    Block,
+    Throttle,
 }
 
 impl Default for MonitorPolicy {
@@ -98,6 +121,7 @@ impl Default for MonitorPolicy {
                 ("hotpatch".to_string(), 50),
             ]),
             hotpatch: HotpatchPolicy::default(),
+            rate_limit_rules: Vec::new(),
         }
     }
 }
@@ -184,8 +208,10 @@ impl RuntimeState {
 
 #[derive(Clone)]
 struct Shared {
-    policy: MonitorPolicy,
+    policy: Arc<RwLock<MonitorPolicy>>,
+    config_path: PathBuf,
     runtime: Arc<RwLock<RuntimeState>>,
+    bpf: Arc<Mutex<Ebpf>>,
     hotpatch_active: Arc<Mutex<bool>>,
     symbol_resolver_ok: Arc<Mutex<bool>>,
 }
@@ -199,13 +225,6 @@ async fn main() -> Result<()> {
     let policy = load_policy(&opt.config).context("load policy")?;
     info!("policy loaded from {}", opt.config.display());
 
-    let shared = Shared {
-        policy: policy.clone(),
-        runtime: Arc::new(RwLock::new(RuntimeState::new())),
-        hotpatch_active: Arc::new(Mutex::new(false)),
-        symbol_resolver_ok: Arc::new(Mutex::new(true)),
-    };
-
     let mut bpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/gaia-xdp"
@@ -215,26 +234,40 @@ async fn main() -> Result<()> {
 
     attach_agents(&mut bpf).context("attach eBPF agents")?;
     apply_blocked_ports(&mut bpf, &policy.blocked_ports).context("configure blocked ports")?;
+    apply_rate_limit_rules(&mut bpf, &policy.rate_limit_rules).context("configure rate limits")?;
+
+    let shared = Shared {
+        policy: Arc::new(RwLock::new(policy.clone())),
+        config_path: opt.config.clone(),
+        runtime: Arc::new(RwLock::new(RuntimeState::new())),
+        bpf: Arc::new(Mutex::new(bpf)),
+        hotpatch_active: Arc::new(Mutex::new(false)),
+        symbol_resolver_ok: Arc::new(Mutex::new(true)),
+    };
 
     // Hotpatch targets are best-effort: failure to attach should not crash.
-    match attach_hotpatch_targets(&mut bpf, &policy.hotpatch.targets, &shared) {
-        Ok(()) => {
-            if !policy.hotpatch.targets.is_empty() {
-                if let Ok(mut h) = shared.hotpatch_active.lock() {
-                    *h = true;
+    {
+        let mut bpf_guard = shared.bpf.lock().unwrap();
+        match attach_hotpatch_targets(&mut bpf_guard, &policy.hotpatch.targets, &shared) {
+            Ok(()) => {
+                if !policy.hotpatch.targets.is_empty() {
+                    if let Ok(mut h) = shared.hotpatch_active.lock() {
+                        *h = true;
+                    }
+                    info!(
+                        "hot-patch agent attached {} target(s)",
+                        policy.hotpatch.targets.len()
+                    );
                 }
-                info!(
-                    "hot-patch agent attached {} target(s)",
-                    policy.hotpatch.targets.len()
-                );
             }
+            Err(err) => warn!("hot-patch attach skipped: {err:#}"),
         }
-        Err(err) => warn!("hot-patch attach skipped: {err:#}"),
+
+        let events = bpf_guard.take_map("EVENTS").context("missing EVENTS map")?;
+        let events = RingBuf::<MapData>::try_from(events).context("open EVENTS ring buffer")?;
+        spawn_event_collector(events, shared.clone());
     }
 
-    let events = bpf.take_map("EVENTS").context("missing EVENTS map")?;
-    let events = RingBuf::<MapData>::try_from(events).context("open EVENTS ring buffer")?;
-    spawn_event_collector(events, shared.clone());
     spawn_service_tracker(shared.clone());
 
     let web_state = shared.clone();
@@ -302,6 +335,11 @@ fn apply_blocked_ports(bpf: &mut Ebpf, blocked_ports: &[u16]) -> Result<()> {
         .map_mut("BLOCKED_PORTS")
         .context("missing BLOCKED_PORTS map")?;
     let mut ports = BpfHashMap::<_, u16, u8>::try_from(map).context("blocked ports map cast")?;
+    // Clear existing entries
+    let existing: Vec<u16> = ports.keys().filter_map(|k| k.ok()).collect();
+    for k in existing {
+        let _ = ports.remove(&k);
+    }
     for port in blocked_ports {
         ports
             .insert(*port, 1, 0)
@@ -309,6 +347,134 @@ fn apply_blocked_ports(bpf: &mut Ebpf, blocked_ports: &[u16]) -> Result<()> {
     }
     info!("blocked ports configured: {blocked_ports:?}");
     Ok(())
+}
+
+fn apply_rate_limit_rules(bpf: &mut Ebpf, rules: &[RateLimitRule]) -> Result<()> {
+    // Update rule count
+    {
+        let map = bpf
+            .map_mut("RATE_LIMIT_RULE_COUNT")
+            .context("missing RATE_LIMIT_RULE_COUNT map")?;
+        let mut arr = BpfArray::<_, u32>::try_from(map).context("rule count array cast")?;
+        arr.set(0, rules.len() as u32, 0)
+            .context("set rule count")?;
+    }
+
+    // Update rules map
+    {
+        let map = bpf
+            .map_mut("RATE_LIMIT_RULES")
+            .context("missing RATE_LIMIT_RULES map")?;
+        let mut rule_map =
+            BpfHashMap::<_, u32, RateLimitEntry>::try_from(map).context("rules map cast")?;
+        // Clear existing
+        let existing: Vec<u32> = rule_map.keys().filter_map(|k| k.ok()).collect();
+        for k in existing {
+            let _ = rule_map.remove(&k);
+        }
+        // Insert new rules
+        for (idx, rule) in rules.iter().enumerate() {
+            if let Some(entry) = parse_rate_limit_to_entry(rule) {
+                rule_map
+                    .insert(idx as u32, entry, 0)
+                    .with_context(|| format!("insert rate limit rule {idx}"))?;
+            }
+        }
+    }
+
+    info!("rate limit rules configured: {} rule(s)", rules.len());
+    Ok(())
+}
+
+fn parse_rate_limit_to_entry(rule: &RateLimitRule) -> Option<RateLimitEntry> {
+    let (addr, prefix_len) = parse_cidr(&rule.cidr)?;
+    let mut network = [0u8; 16];
+    let octets = addr.octets();
+    network[0] = octets[0];
+    network[1] = octets[1];
+    network[2] = octets[2];
+    network[3] = octets[3];
+
+    let action = match rule.action {
+        RateLimitAction::Log => gaia_xdp_common::RATE_ACTION_LOG,
+        RateLimitAction::Block => gaia_xdp_common::RATE_ACTION_BLOCK,
+        RateLimitAction::Throttle => gaia_xdp_common::RATE_ACTION_THROTTLE,
+    };
+
+    Some(RateLimitEntry {
+        network,
+        prefix_len,
+        action,
+        enabled: if rule.enabled { 1 } else { 0 },
+        _pad: 0,
+        max_conn_per_sec: rule.max_conn_per_sec,
+    })
+}
+
+fn parse_cidr(cidr: &str) -> Option<(Ipv4Addr, u8)> {
+    if let Some((addr_str, prefix_str)) = cidr.split_once('/') {
+        let addr: Ipv4Addr = addr_str.parse().ok()?;
+        let prefix: u8 = prefix_str.parse().ok()?;
+        if prefix > 32 {
+            return None;
+        }
+        Some((addr, prefix))
+    } else {
+        // Treat as /32
+        let addr: Ipv4Addr = cidr.parse().ok()?;
+        Some((addr, 32))
+    }
+}
+
+fn sync_bpf_blocked_ports(shared: &Shared, blocked_ports: &[u16]) {
+    if let Ok(mut bpf) = shared.bpf.lock() {
+        if let Err(err) = apply_blocked_ports(&mut bpf, blocked_ports) {
+            warn!("failed to sync blocked ports to BPF: {err:#}");
+        }
+    }
+}
+
+fn sync_bpf_rate_limits(shared: &Shared, rules: &[RateLimitRule]) {
+    if let Ok(mut bpf) = shared.bpf.lock() {
+        if let Err(err) = apply_rate_limit_rules(&mut bpf, rules) {
+            warn!("failed to sync rate limit rules to BPF: {err:#}");
+        }
+    }
+}
+
+fn sync_bpf_hotpatch_pids(shared: &Shared, targets: &[HotpatchTarget]) {
+    if let Ok(mut bpf) = shared.bpf.lock() {
+        let map = match bpf.map_mut("HOTPATCH_PIDS") {
+            Some(map) => map,
+            None => {
+                warn!("missing HOTPATCH_PIDS map");
+                return;
+            }
+        };
+        let mut pid_map = match BpfHashMap::<_, u32, HotpatchPidEntry>::try_from(map) {
+            Ok(m) => m,
+            Err(err) => {
+                warn!("hotpatch pids map cast failed: {err:#}");
+                return;
+            }
+        };
+        // Clear existing
+        let existing: Vec<u32> = pid_map.keys().filter_map(|k| k.ok()).collect();
+        for k in existing {
+            let _ = pid_map.remove(&k);
+        }
+        // Insert PIDs from targets
+        for target in targets {
+            if let Some(pid) = target.pid {
+                let entry = HotpatchPidEntry {
+                    active: 1,
+                    _pad: [0; 3],
+                };
+                let _ = pid_map.insert(pid, entry, 0);
+            }
+        }
+        info!("hotpatch PID filter updated: {} target(s)", targets.len());
+    }
 }
 
 fn attach_hotpatch_targets(
@@ -451,12 +617,13 @@ fn spawn_event_collector(events: RingBuf<MapData>, shared: Shared) {
 // ── Systemd service tracker ──
 
 fn spawn_service_tracker(shared: Shared) {
-    let services = shared.policy.monitored_services.clone();
     tokio::spawn(async move {
-        if services.is_empty() {
-            return;
-        }
         loop {
+            let services = shared.policy.read().await.monitored_services.clone();
+            if services.is_empty() {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                continue;
+            }
             let mut mapping = HashMap::<String, Vec<u32>>::new();
             for service in &services {
                 if let Some(pid) = query_service_pid(service).await {
@@ -496,6 +663,7 @@ async fn query_service_pid(service: &str) -> Option<u32> {
 async fn process_event(event: KernelEvent, shared: &Shared) {
     let record = to_event_record(event);
     let mut state = shared.runtime.write().await;
+    let policy = shared.policy.read().await;
 
     let key = record.kind.clone();
     *state.counters.entry(key.clone()).or_insert(0) += 1;
@@ -510,7 +678,7 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
     let baseline_now = *baseline_count;
 
     // Baseline spike detection
-    if let Some(threshold) = shared.policy.baseline_thresholds.get(&key)
+    if let Some(threshold) = policy.baseline_thresholds.get(&key)
         && baseline_now > *threshold
     {
         push_alert(
@@ -524,7 +692,7 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
     // Whitelist rule: sensitive file access
     if event.kind == EVENT_KIND_FILE_IO
         && event.action == EVENT_ACTION_ALERT
-        && file_path_sensitive(&record.detail, &shared.policy)
+        && file_path_sensitive(&record.detail, &policy)
     {
         push_alert(
             &mut state,
@@ -535,7 +703,7 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
     }
 
     // Whitelist rule: execve path check
-    if event.kind == EVENT_KIND_PROCESS && !exec_path_whitelisted(&record.detail, &shared.policy) {
+    if event.kind == EVENT_KIND_PROCESS && !exec_path_whitelisted(&record.detail, &policy) {
         push_alert(
             &mut state,
             "high",
@@ -560,6 +728,16 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
             &mut state,
             "critical",
             "blocked port hit — active defense policy triggered".into(),
+            &record,
+        );
+    }
+
+    // Rate limit exceeded
+    if event.kind == EVENT_KIND_NETWORK && event.action == EVENT_ACTION_RATE_LIMITED {
+        push_alert(
+            &mut state,
+            "high",
+            format!("IP rate limit exceeded — {}", record.detail),
             &record,
         );
     }
@@ -646,6 +824,7 @@ fn action_name(action: u8) -> &'static str {
         2 => "exit",
         3 => "alert",
         4 => "blocked",
+        5 => "rate_limited",
         _ => "unknown",
     }
 }
@@ -744,10 +923,32 @@ fn resolve_process_mapping_base(pid: u32, binary: &Path) -> Result<u64> {
 async fn run_http_server(shared: Shared, addr: String) -> Result<()> {
     let cors = CorsLayer::new()
         .allow_origin("*".parse::<HeaderValue>().unwrap())
-        .allow_methods([Method::GET]);
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_headers(vec![header::CONTENT_TYPE, header::ACCEPT]);
 
     let app = Router::new()
         .route("/api/v1/state", get(api_state))
+        .route("/api/v1/config", get(api_get_config).post(api_update_config))
+        .route(
+            "/api/v1/config/rate-limit",
+            get(api_get_rate_limits)
+                .post(api_add_rate_limit)
+                .put(api_update_rate_limit),
+        )
+        .route(
+            "/api/v1/config/rate-limit/{index}",
+            axum::routing::delete(api_delete_rate_limit),
+        )
+        .route(
+            "/api/v1/config/hotpatch",
+            get(api_get_hotpatch)
+                .post(api_add_hotpatch)
+                .put(api_update_hotpatch),
+        )
+        .route(
+            "/api/v1/config/hotpatch/{index}",
+            axum::routing::delete(api_delete_hotpatch),
+        )
         .with_state(shared)
         .layer(cors);
 
@@ -783,4 +984,179 @@ async fn api_state(State(shared): State<Shared>) -> Json<Snapshot> {
         alerts: state.alerts.iter().cloned().collect(),
     };
     Json(snapshot)
+}
+
+// ── Config API: full policy ──
+
+async fn api_get_config(State(shared): State<Shared>) -> Json<MonitorPolicy> {
+    let policy = shared.policy.read().await;
+    Json(policy.clone())
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfigUpdate {
+    #[serde(default)]
+    sensitive_prefixes: Option<Vec<String>>,
+    #[serde(default)]
+    monitored_services: Option<Vec<String>>,
+    #[serde(default)]
+    exec_whitelist_prefixes: Option<Vec<String>>,
+    #[serde(default)]
+    blocked_ports: Option<Vec<u16>>,
+    #[serde(default)]
+    baseline_thresholds: Option<HashMap<String, u32>>,
+}
+
+async fn api_update_config(
+    State(shared): State<Shared>,
+    Json(update): Json<ConfigUpdate>,
+) -> Json<MonitorPolicy> {
+    let mut policy = shared.policy.write().await;
+    if let Some(v) = update.sensitive_prefixes {
+        policy.sensitive_prefixes = v;
+    }
+    if let Some(v) = update.monitored_services {
+        policy.monitored_services = v;
+    }
+    if let Some(v) = update.exec_whitelist_prefixes {
+        policy.exec_whitelist_prefixes = v;
+    }
+    if let Some(ref v) = update.blocked_ports {
+        policy.blocked_ports = v.clone();
+    }
+    if let Some(v) = update.baseline_thresholds {
+        policy.baseline_thresholds = v;
+    }
+    let snapshot = policy.clone();
+    drop(policy);
+    // Sync blocked ports to BPF if changed
+    if update.blocked_ports.is_some() {
+        sync_bpf_blocked_ports(&shared, &snapshot.blocked_ports);
+    }
+    persist_policy(&shared).await;
+    Json(snapshot)
+}
+
+// ── Config API: rate limit rules ──
+
+async fn api_get_rate_limits(State(shared): State<Shared>) -> Json<Vec<RateLimitRule>> {
+    let policy = shared.policy.read().await;
+    Json(policy.rate_limit_rules.clone())
+}
+
+async fn api_add_rate_limit(
+    State(shared): State<Shared>,
+    Json(rule): Json<RateLimitRule>,
+) -> Json<Vec<RateLimitRule>> {
+    let mut policy = shared.policy.write().await;
+    policy.rate_limit_rules.push(rule);
+    let rules = policy.rate_limit_rules.clone();
+    drop(policy);
+    sync_bpf_rate_limits(&shared, &rules);
+    persist_policy(&shared).await;
+    Json(rules)
+}
+
+#[derive(Debug, Deserialize)]
+struct IndexedUpdate<T> {
+    index: usize,
+    #[serde(flatten)]
+    data: T,
+}
+
+async fn api_update_rate_limit(
+    State(shared): State<Shared>,
+    Json(update): Json<IndexedUpdate<RateLimitRule>>,
+) -> Json<Vec<RateLimitRule>> {
+    let mut policy = shared.policy.write().await;
+    if update.index < policy.rate_limit_rules.len() {
+        policy.rate_limit_rules[update.index] = update.data;
+    }
+    let rules = policy.rate_limit_rules.clone();
+    drop(policy);
+    sync_bpf_rate_limits(&shared, &rules);
+    persist_policy(&shared).await;
+    Json(rules)
+}
+
+async fn api_delete_rate_limit(
+    State(shared): State<Shared>,
+    axum::extract::Path(index): axum::extract::Path<usize>,
+) -> Json<Vec<RateLimitRule>> {
+    let mut policy = shared.policy.write().await;
+    if index < policy.rate_limit_rules.len() {
+        policy.rate_limit_rules.remove(index);
+    }
+    let rules = policy.rate_limit_rules.clone();
+    drop(policy);
+    sync_bpf_rate_limits(&shared, &rules);
+    persist_policy(&shared).await;
+    Json(rules)
+}
+
+// ── Config API: hotpatch targets ──
+
+async fn api_get_hotpatch(State(shared): State<Shared>) -> Json<Vec<HotpatchTarget>> {
+    let policy = shared.policy.read().await;
+    Json(policy.hotpatch.targets.clone())
+}
+
+async fn api_add_hotpatch(
+    State(shared): State<Shared>,
+    Json(target): Json<HotpatchTarget>,
+) -> Json<Vec<HotpatchTarget>> {
+    let mut policy = shared.policy.write().await;
+    policy.hotpatch.targets.push(target);
+    let targets = policy.hotpatch.targets.clone();
+    drop(policy);
+    sync_bpf_hotpatch_pids(&shared, &targets);
+    persist_policy(&shared).await;
+    Json(targets)
+}
+
+async fn api_update_hotpatch(
+    State(shared): State<Shared>,
+    Json(update): Json<IndexedUpdate<HotpatchTarget>>,
+) -> Json<Vec<HotpatchTarget>> {
+    let mut policy = shared.policy.write().await;
+    if update.index < policy.hotpatch.targets.len() {
+        policy.hotpatch.targets[update.index] = update.data;
+    }
+    let targets = policy.hotpatch.targets.clone();
+    drop(policy);
+    sync_bpf_hotpatch_pids(&shared, &targets);
+    persist_policy(&shared).await;
+    Json(targets)
+}
+
+async fn api_delete_hotpatch(
+    State(shared): State<Shared>,
+    axum::extract::Path(index): axum::extract::Path<usize>,
+) -> Json<Vec<HotpatchTarget>> {
+    let mut policy = shared.policy.write().await;
+    if index < policy.hotpatch.targets.len() {
+        policy.hotpatch.targets.remove(index);
+    }
+    let targets = policy.hotpatch.targets.clone();
+    drop(policy);
+    sync_bpf_hotpatch_pids(&shared, &targets);
+    persist_policy(&shared).await;
+    Json(targets)
+}
+
+// ── Persist policy to config file ──
+
+async fn persist_policy(shared: &Shared) {
+    let policy = shared.policy.read().await;
+    let path = &shared.config_path;
+    match toml::to_string_pretty(&*policy) {
+        Ok(content) => {
+            if let Err(err) = fs::write(path, content) {
+                warn!("failed to persist config to {}: {err:#}", path.display());
+            } else {
+                info!("config persisted to {}", path.display());
+            }
+        }
+        Err(err) => warn!("failed to serialize config: {err:#}"),
+    }
 }

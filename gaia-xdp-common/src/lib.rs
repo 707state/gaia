@@ -14,10 +14,58 @@ pub const EVENT_ACTION_ENTER: u8 = 1;
 pub const EVENT_ACTION_EXIT: u8 = 2;
 pub const EVENT_ACTION_ALERT: u8 = 3;
 pub const EVENT_ACTION_BLOCKED: u8 = 4;
+pub const EVENT_ACTION_RATE_LIMITED: u8 = 5;
 
 pub const PROTOCOL_UNKNOWN: u8 = 0;
 pub const PROTOCOL_TCP: u8 = 6;
 pub const PROTOCOL_UDP: u8 = 17;
+
+pub const RATE_ACTION_LOG: u8 = 0;
+pub const RATE_ACTION_BLOCK: u8 = 1;
+pub const RATE_ACTION_THROTTLE: u8 = 2;
+
+pub const MAX_RATE_LIMIT_RULES: u32 = 64;
+pub const MAX_RATE_LIMIT_COUNTERS: u32 = 65536;
+pub const MAX_HOTPATCH_PIDS: u32 = 256;
+
+/// A CIDR-based rate limit rule stored in BPF HashMap.
+/// Key: rule index (u32). Value: this struct.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RateLimitEntry {
+    /// Network address in network byte order (IPv4 in first 4 bytes)
+    pub network: [u8; 16],
+    /// CIDR prefix length (e.g. 24 for /24)
+    pub prefix_len: u8,
+    /// Action: RATE_ACTION_LOG / RATE_ACTION_BLOCK / RATE_ACTION_THROTTLE
+    pub action: u8,
+    /// Whether this rule is enabled
+    pub enabled: u8,
+    pub _pad: u8,
+    /// Max connections per second
+    pub max_conn_per_sec: u32,
+}
+
+/// Per-IP connection counter for rate limiting.
+/// Key: IPv4 addr as u32. Value: this struct.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RateLimitCounter {
+    pub count: u32,
+    pub last_reset_ns: u64,
+    /// Which rule index matched (for reporting)
+    pub rule_idx: u32,
+}
+
+/// Hotpatch PID filter entry.
+/// Key: PID (u32). Value: this struct.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct HotpatchPidEntry {
+    /// 1 = active, 0 = inactive
+    pub active: u8,
+    pub _pad: [u8; 3],
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -57,4 +105,13 @@ impl KernelEvent {
             detail: [0; DETAIL_LEN],
         }
     }
+}
+
+#[cfg(feature = "user")]
+mod pod_impls {
+    use super::*;
+    unsafe impl aya::Pod for RateLimitEntry {}
+    unsafe impl aya::Pod for RateLimitCounter {}
+    unsafe impl aya::Pod for HotpatchPidEntry {}
+    unsafe impl aya::Pod for KernelEvent {}
 }
