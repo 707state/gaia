@@ -11,26 +11,23 @@ use aya_ebpf::{
     programs::{ProbeContext, RetProbeContext, TracePointContext},
 };
 use gaia_xdp_common::{
-    KernelEvent, EVENT_ACTION_ALERT, EVENT_ACTION_BLOCKED, EVENT_ACTION_ENTER, EVENT_ACTION_EXIT,
+    HotpatchPidEntry, KernelEvent, RateLimitCounter, RateLimitEntry, EVENT_ACTION_ALERT,
+    EVENT_ACTION_BLOCKED, EVENT_ACTION_ENTER, EVENT_ACTION_EXIT, EVENT_ACTION_RATE_LIMITED,
     EVENT_KIND_FILE_IO, EVENT_KIND_HOTPATCH, EVENT_KIND_NETWORK, EVENT_KIND_PRIVILEGE,
-    EVENT_KIND_PROCESS, PROTOCOL_TCP,
+    EVENT_KIND_PROCESS, MAX_HOTPATCH_PIDS, MAX_RATE_LIMIT_COUNTERS, MAX_RATE_LIMIT_RULES,
+    PROTOCOL_TCP, RATE_ACTION_BLOCK,
 };
 
-// ── Tracepoint field offsets (from /sys/kernel/debug/tracing/events/...) ──
-// openat: dfd@16, filename@24, flags@32, mode@40
+// ── Tracepoint field offsets ──
 const OPENAT_FILENAME_OFFSET: usize = 24;
-// exit_openat: ret@16
 const EXIT_RET_OFFSET: usize = 16;
-// execve: filename@16
 const EXECVE_FILENAME_OFFSET: usize = 16;
-// setuid: uid@16 ; setgid: gid@16
 const SETID_VAL_OFFSET: usize = 16;
-// connect: fd@16, uservaddr@24, addrlen@32
-// bind:    fd@16, umyaddr@24,   addrlen@32
 const SOCKADDR_PTR_OFFSET: usize = 24;
 
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
+const ONE_SEC_NS: u64 = 1_000_000_000;
 
 const SENSITIVE_PATHS: [&[u8]; 4] = [b"/etc/shadow", b"/etc/ssl", b"/root/.ssh", b"/var/lib/gaia"];
 
@@ -59,15 +56,35 @@ struct SockAddrIn6 {
     sin6_scope_id: u32,
 }
 
+// ── BPF Maps ──
+
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 #[map]
 static BLOCKED_PORTS: HashMap<u16, u8> = HashMap::with_max_entries(128, 0);
 
-/// Scratch space for building KernelEvent without blowing the 512-byte BPF stack.
 #[map]
 static SCRATCH: Array<KernelEvent> = Array::with_max_entries(1, 0);
+
+/// Rate limit rules: key = rule index (u32), value = RateLimitEntry
+#[map]
+static RATE_LIMIT_RULES: HashMap<u32, RateLimitEntry> =
+    HashMap::with_max_entries(MAX_RATE_LIMIT_RULES, 0);
+
+/// Number of active rate limit rules (stored at index 0)
+#[map]
+static RATE_LIMIT_RULE_COUNT: Array<u32> = Array::with_max_entries(1, 0);
+
+/// Per-IP connection counters: key = IPv4 addr as u32
+#[map]
+static RATE_LIMIT_COUNTERS: HashMap<u32, RateLimitCounter> =
+    HashMap::with_max_entries(MAX_RATE_LIMIT_COUNTERS, 0);
+
+/// Hotpatch PID filter: key = PID (u32), value = HotpatchPidEntry
+#[map]
+static HOTPATCH_PIDS: HashMap<u32, HotpatchPidEntry> =
+    HashMap::with_max_entries(MAX_HOTPATCH_PIDS, 0);
 
 // ── helpers ──
 
@@ -116,8 +133,7 @@ fn copy_bytes(dst: &mut [u8], src: &[u8]) {
 fn is_sensitive_path(path: &[u8]) -> bool {
     let mut i = 0;
     while i < SENSITIVE_PATHS.len() {
-        let prefix = SENSITIVE_PATHS[i];
-        if starts_with(path, prefix) {
+        if starts_with(path, SENSITIVE_PATHS[i]) {
             return true;
         }
         i += 1;
@@ -137,6 +153,83 @@ fn starts_with(input: &[u8], prefix: &[u8]) -> bool {
         i += 1;
     }
     true
+}
+
+/// Check if an IPv4 address (as u32 in network byte order) matches a CIDR rule.
+#[inline(always)]
+fn ipv4_matches_cidr(addr: u32, network: &[u8; 16], prefix_len: u8) -> bool {
+    if prefix_len == 0 {
+        return true;
+    }
+    if prefix_len > 32 {
+        return false;
+    }
+    // Build network u32 from first 4 bytes (network byte order)
+    let net = u32::from_be_bytes([network[0], network[1], network[2], network[3]]);
+    let addr_host = u32::from_be(addr);
+    let net_host = u32::from_be(net);
+    let mask = if prefix_len == 32 {
+        0xFFFF_FFFFu32
+    } else {
+        !((1u32 << (32 - prefix_len)) - 1)
+    };
+    (addr_host & mask) == (net_host & mask)
+}
+
+/// Check rate limit rules against an IPv4 address. Returns the action if rate exceeded.
+#[inline(always)]
+fn check_rate_limit_ipv4(addr: u32, now_ns: u64) -> Option<u8> {
+    let count_ptr = RATE_LIMIT_RULE_COUNT.get_ptr(0)?;
+    let rule_count = unsafe { *count_ptr };
+    if rule_count == 0 {
+        return None;
+    }
+
+    // Iterate rules (bounded to avoid verifier issues)
+    let max = if rule_count > 16 { 16 } else { rule_count };
+    let mut idx: u32 = 0;
+    while idx < max {
+        if let Some(rule) = unsafe { RATE_LIMIT_RULES.get(&idx) } {
+            if rule.enabled != 0 && ipv4_matches_cidr(addr, &rule.network, rule.prefix_len) {
+                // Check / update per-IP counter
+                if let Some(counter) = unsafe { RATE_LIMIT_COUNTERS.get(&addr) } {
+                    let elapsed = now_ns.saturating_sub(counter.last_reset_ns);
+                    if elapsed >= ONE_SEC_NS {
+                        // Window expired, reset
+                        let new_counter = RateLimitCounter {
+                            count: 1,
+                            last_reset_ns: now_ns,
+                            rule_idx: idx,
+                        };
+                        let _ = RATE_LIMIT_COUNTERS.insert(&addr, &new_counter, 0);
+                    } else {
+                        let new_count = counter.count + 1;
+                        if new_count > rule.max_conn_per_sec {
+                            return Some(rule.action);
+                        }
+                        let new_counter = RateLimitCounter {
+                            count: new_count,
+                            last_reset_ns: counter.last_reset_ns,
+                            rule_idx: idx,
+                        };
+                        let _ = RATE_LIMIT_COUNTERS.insert(&addr, &new_counter, 0);
+                    }
+                } else {
+                    // First connection from this IP
+                    let new_counter = RateLimitCounter {
+                        count: 1,
+                        last_reset_ns: now_ns,
+                        rule_idx: idx,
+                    };
+                    let _ = RATE_LIMIT_COUNTERS.insert(&addr, &new_counter, 0);
+                }
+                // Rule matched, stop checking further rules
+                return None;
+            }
+        }
+        idx += 1;
+    }
+    None
 }
 
 // ── File I/O Agent ──
@@ -221,7 +314,7 @@ fn handle_privilege_change(ctx: TracePointContext, is_uid: bool) -> u32 {
     } else {
         copy_bytes(&mut event.detail, b"setgid:");
     }
-    let prefix_len = 7; // "setuid:" or "setgid:"
+    let prefix_len = 7;
     let mut buf = [0u8; 10];
     let n = u32_to_ascii(val, &mut buf);
     let mut j = 0;
@@ -234,7 +327,7 @@ fn handle_privilege_change(ctx: TracePointContext, is_uid: bool) -> u32 {
     0
 }
 
-// ── Network Telemetry Agent ──
+// ── Network Telemetry Agent (with rate limiting) ──
 
 #[tracepoint]
 pub fn tp_sys_enter_connect(ctx: TracePointContext) -> u32 {
@@ -270,6 +363,20 @@ fn handle_network_event(ctx: TracePointContext, default_action: u8) -> Result<()
         event.addr[1] = addr_bytes[1];
         event.addr[2] = addr_bytes[2];
         event.addr[3] = addr_bytes[3];
+
+        // Check rate limit for this IPv4 address
+        let now_ns = unsafe { bpf_ktime_get_ns() };
+        if let Some(action) = check_rate_limit_ipv4(sockaddr.sin_addr, now_ns) {
+            if action == RATE_ACTION_BLOCK {
+                event.action = EVENT_ACTION_BLOCKED;
+                copy_bytes(&mut event.detail, b"rate-limit:blocked");
+            } else {
+                event.action = EVENT_ACTION_RATE_LIMITED;
+                copy_bytes(&mut event.detail, b"rate-limit:exceeded");
+            }
+            emit(event);
+            return Ok(());
+        }
     } else if family == AF_INET6 {
         let sockaddr: SockAddrIn6 =
             unsafe { bpf_probe_read_user(sockaddr_ptr as *const SockAddrIn6) }.map_err(|_| 1)?;
@@ -279,6 +386,7 @@ fn handle_network_event(ctx: TracePointContext, default_action: u8) -> Result<()
         return Ok(());
     }
 
+    // Check blocked ports
     if unsafe { BLOCKED_PORTS.get(&event.port).is_some() } {
         event.action = EVENT_ACTION_BLOCKED;
     }
@@ -287,7 +395,7 @@ fn handle_network_event(ctx: TracePointContext, default_action: u8) -> Result<()
     Ok(())
 }
 
-// ── Hot-patching Agent ──
+// ── Hot-patching Agent (with PID filtering) ──
 
 #[kprobe]
 pub fn kprobe_hotpatch_guard(ctx: ProbeContext) -> u32 {
@@ -305,6 +413,18 @@ pub fn uprobe_hotpatch_entry(_ctx: ProbeContext) -> u32 {
     let Some(ptr) = get_scratch() else { return 0 };
     let event = unsafe { &mut *ptr };
     fill_base(event, EVENT_KIND_HOTPATCH, EVENT_ACTION_ENTER);
+
+    // Check if this PID is in the hotpatch filter
+    let pid = bpf_get_current_pid_tgid() as u32;
+    if let Some(entry) = unsafe { HOTPATCH_PIDS.get(&pid) } {
+        if entry.active != 0 {
+            copy_bytes(&mut event.detail, b"uprobe-entry:filtered");
+            event.action = EVENT_ACTION_BLOCKED;
+            emit(event);
+            return 0;
+        }
+    }
+
     copy_bytes(&mut event.detail, b"uprobe-entry");
     emit(event);
     0
@@ -315,6 +435,16 @@ pub fn uretprobe_hotpatch_exit(_ctx: RetProbeContext) -> u32 {
     let Some(ptr) = get_scratch() else { return 0 };
     let event = unsafe { &mut *ptr };
     fill_base(event, EVENT_KIND_HOTPATCH, EVENT_ACTION_EXIT);
+
+    let pid = bpf_get_current_pid_tgid() as u32;
+    if let Some(entry) = unsafe { HOTPATCH_PIDS.get(&pid) } {
+        if entry.active != 0 {
+            copy_bytes(&mut event.detail, b"uretprobe-exit:filtered");
+            emit(event);
+            return 0;
+        }
+    }
+
     copy_bytes(&mut event.detail, b"uretprobe-exit");
     emit(event);
     0
