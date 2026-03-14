@@ -67,3 +67,5 @@ The user-space agent is a high-performance Rust daemon that acts as the brain of
   - *白名单规则*：基于 YAML/TOML 配置文件，对进程行为进行合规性校验。
   - *统计基线*：对系统调用频率等数值型指标建立动态基线，检测异常峰值。
 - **动态符号解析器**：实时解析目标二进制文件的 ELF 符号表（`.symtab`/`.dynsym`）和 `/proc/[pid]/maps`，计算出函数在运行时的绝对内存地址，从而克服 ASLR（地址空间布局随机化）限制，精准挂载 `uprobe`。
+
+
