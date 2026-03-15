@@ -67,7 +67,6 @@ export type ServiceTrafficSnapshot = {
 
 export type TrafficDataPoint = {
   timestamp_ms: number
-  service: string
   bytes_sent: number
   bytes_recv: number
   packets_sent: number
@@ -75,6 +74,10 @@ export type TrafficDataPoint = {
 }
 
 export type TrafficResponse = {
+  system_bytes_sent: number
+  system_bytes_recv: number
+  system_packets_sent: number
+  system_packets_recv: number
   services: ServiceTrafficSnapshot[]
   history: TrafficDataPoint[]
 }

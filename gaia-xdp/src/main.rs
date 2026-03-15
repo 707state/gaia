@@ -192,19 +192,30 @@ struct ServiceTrafficSnapshot {
     packets_recv: u64,
 }
 
+/// A single time-series sample for the line chart.
 #[derive(Debug, Clone, Serialize)]
 struct TrafficDataPoint {
     timestamp_ms: u64,
-    service: String,
+    /// System-wide bytes sent delta
     bytes_sent: u64,
+    /// System-wide bytes received delta
     bytes_recv: u64,
+    /// System-wide packets sent delta
     packets_sent: u64,
+    /// System-wide packets received delta
     packets_recv: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct TrafficResponse {
+    /// System-wide cumulative totals
+    system_bytes_sent: u64,
+    system_bytes_recv: u64,
+    system_packets_sent: u64,
+    system_packets_recv: u64,
+    /// Per-service traffic breakdown
     services: Vec<ServiceTrafficSnapshot>,
+    /// System-wide time-series history (for line chart)
     history: Vec<TrafficDataPoint>,
 }
 
@@ -223,9 +234,9 @@ struct RuntimeState {
     events: VecDeque<EventRecord>,
     alerts: VecDeque<AlertRecord>,
     baseline: BaselineState,
-    /// Per-service previous traffic totals (for computing deltas)
-    traffic_prev: HashMap<String, ServiceTrafficSnapshot>,
-    /// Time-series traffic history
+    /// Previous system-wide traffic totals (for computing deltas)
+    traffic_prev_total: (u64, u64, u64, u64),
+    /// Time-series traffic history (system-wide)
     traffic_history: VecDeque<TrafficDataPoint>,
 }
 
@@ -240,7 +251,7 @@ impl RuntimeState {
                 window_started: Instant::now(),
                 counters: HashMap::new(),
             },
-            traffic_prev: HashMap::new(),
+            traffic_prev_total: (0, 0, 0, 0),
             traffic_history: VecDeque::new(),
         }
     }
@@ -734,8 +745,9 @@ fn spawn_service_tracker(shared: Shared) {
             }
             let mut mapping = HashMap::<String, Vec<u32>>::new();
             for service in &services {
-                if let Some(pid) = query_service_pid(service).await {
-                    mapping.insert(service.clone(), vec![pid]);
+                let pids = query_service_pids(service).await;
+                if !pids.is_empty() {
+                    mapping.insert(service.clone(), pids);
                 }
             }
 
@@ -750,24 +762,75 @@ fn spawn_service_tracker(shared: Shared) {
     });
 }
 
-async fn query_service_pid(service: &str) -> Option<u32> {
-    let output = Command::new("systemctl")
-        .arg("show")
-        .arg(service)
-        .arg("--property")
-        .arg("MainPID")
-        .arg("--value")
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
+/// Query all PIDs belonging to a systemd service (main + children).
+async fn query_service_pids(service: &str) -> Vec<u32> {
+    let mut pids = Vec::new();
+    // Get MainPID
+    let main_pid = async {
+        let output = Command::new("systemctl")
+            .arg("show")
+            .arg(service)
+            .arg("--property")
+            .arg("MainPID")
+            .arg("--value")
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let pid = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u32>()
+            .ok()?;
+        (pid > 0).then_some(pid)
     }
-    let pid = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u32>()
-        .ok()?;
-    (pid > 0).then_some(pid)
+    .await;
+
+    let Some(main) = main_pid else {
+        return pids;
+    };
+    pids.push(main);
+
+    // Find all descendant PIDs by walking /proc/*/stat for ppid chains
+    if let Ok(entries) = fs::read_dir("/proc") {
+        let mut child_map: HashMap<u32, Vec<u32>> = HashMap::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            let Ok(pid) = name_str.parse::<u32>() else {
+                continue;
+            };
+            let stat_path = format!("/proc/{pid}/stat");
+            if let Ok(stat) = fs::read_to_string(&stat_path) {
+                // Format: "pid (comm) state ppid ..."
+                // Find closing ')' then parse fields after it
+                if let Some(close_paren) = stat.rfind(')') {
+                    let rest = &stat[close_paren + 2..];
+                    let fields: Vec<&str> = rest.split_whitespace().collect();
+                    // fields[0] = state, fields[1] = ppid
+                    if let Some(ppid_str) = fields.get(1) {
+                        if let Ok(ppid) = ppid_str.parse::<u32>() {
+                            child_map.entry(ppid).or_default().push(pid);
+                        }
+                    }
+                }
+            }
+        }
+        // BFS from main PID to find all descendants
+        let mut queue = vec![main];
+        while let Some(parent) = queue.pop() {
+            if let Some(children) = child_map.get(&parent) {
+                for &child in children {
+                    if !pids.contains(&child) {
+                        pids.push(child);
+                        queue.push(child);
+                    }
+                }
+            }
+        }
+    }
+    pids
 }
 
 /// Sync monitored service PIDs into the SERVICE_PIDS BPF map so that
@@ -807,22 +870,40 @@ fn sync_bpf_service_pids(shared: &Shared, mapping: &HashMap<String, Vec<u32>>) {
     }
 }
 
-/// Read per-PID traffic stats from the BPF map and aggregate by service.
-fn read_bpf_traffic_stats(
+/// Read ALL per-PID traffic stats from the BPF map.
+/// Returns (system_wide_totals, per_service_snapshots).
+fn read_all_traffic_stats(
     shared: &Shared,
     service_map: &HashMap<String, Vec<u32>>,
-) -> Vec<ServiceTrafficSnapshot> {
-    let mut results = Vec::new();
+) -> ((u64, u64, u64, u64), Vec<ServiceTrafficSnapshot>) {
+    let mut sys = (0u64, 0u64, 0u64, 0u64);
+    let mut svc_results = Vec::new();
+
     let Ok(mut bpf) = shared.bpf.lock() else {
-        return results;
+        return (sys, svc_results);
     };
     let Some(map) = bpf.map_mut("TRAFFIC_STATS") else {
-        return results;
+        return (sys, svc_results);
     };
     let Ok(stats_map) = BpfHashMap::<_, u32, TrafficStats>::try_from(map) else {
-        return results;
+        return (sys, svc_results);
     };
 
+    // Collect all PID stats into a HashMap for quick lookup
+    let mut all_stats = HashMap::<u32, TrafficStats>::new();
+    for key in stats_map.keys() {
+        if let Ok(pid) = key {
+            if let Ok(stats) = stats_map.get(&pid, 0) {
+                sys.0 += stats.bytes_sent;
+                sys.1 += stats.bytes_recv;
+                sys.2 += stats.packets_sent;
+                sys.3 += stats.packets_recv;
+                all_stats.insert(pid, stats);
+            }
+        }
+    }
+
+    // Aggregate per-service
     for (svc, pids) in service_map {
         let mut snap = ServiceTrafficSnapshot {
             service: svc.clone(),
@@ -830,62 +911,44 @@ fn read_bpf_traffic_stats(
             ..Default::default()
         };
         for &pid in pids {
-            if let Ok(stats) = stats_map.get(&pid, 0) {
+            if let Some(stats) = all_stats.get(&pid) {
                 snap.bytes_sent += stats.bytes_sent;
                 snap.bytes_recv += stats.bytes_recv;
                 snap.packets_sent += stats.packets_sent;
                 snap.packets_recv += stats.packets_recv;
             }
         }
-        results.push(snap);
+        svc_results.push(snap);
     }
-    results
+
+    (sys, svc_results)
 }
 
 /// Spawn a periodic task that samples traffic stats every 2 seconds,
-/// computes deltas, and stores time-series history.
+/// computes system-wide deltas, and stores time-series history.
 fn spawn_traffic_collector(shared: Shared) {
     const MAX_TRAFFIC_HISTORY: usize = 900; // ~30 min at 2s intervals
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
             let service_map = shared.runtime.read().await.service_map.clone();
-            if service_map.is_empty() {
-                continue;
-            }
-            let current = read_bpf_traffic_stats(&shared, &service_map);
+            let (sys_total, _svc_snaps) = read_all_traffic_stats(&shared, &service_map);
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
 
             let mut state = shared.runtime.write().await;
-            for snap in &current {
-                let prev = state.traffic_prev.get(&snap.service);
-                let delta_sent = snap.bytes_sent.saturating_sub(
-                    prev.map(|p| p.bytes_sent).unwrap_or(0),
-                );
-                let delta_recv = snap.bytes_recv.saturating_sub(
-                    prev.map(|p| p.bytes_recv).unwrap_or(0),
-                );
-                let delta_ps = snap.packets_sent.saturating_sub(
-                    prev.map(|p| p.packets_sent).unwrap_or(0),
-                );
-                let delta_pr = snap.packets_recv.saturating_sub(
-                    prev.map(|p| p.packets_recv).unwrap_or(0),
-                );
-                state.traffic_history.push_back(TrafficDataPoint {
-                    timestamp_ms: now_ms,
-                    service: snap.service.clone(),
-                    bytes_sent: delta_sent,
-                    bytes_recv: delta_recv,
-                    packets_sent: delta_ps,
-                    packets_recv: delta_pr,
-                });
-                state
-                    .traffic_prev
-                    .insert(snap.service.clone(), snap.clone());
-            }
+            let prev = state.traffic_prev_total;
+            let delta = TrafficDataPoint {
+                timestamp_ms: now_ms,
+                bytes_sent: sys_total.0.saturating_sub(prev.0),
+                bytes_recv: sys_total.1.saturating_sub(prev.1),
+                packets_sent: sys_total.2.saturating_sub(prev.2),
+                packets_recv: sys_total.3.saturating_sub(prev.3),
+            };
+            state.traffic_prev_total = sys_total;
+            state.traffic_history.push_back(delta);
             while state.traffic_history.len() > MAX_TRAFFIC_HISTORY {
                 state.traffic_history.pop_front();
             }
@@ -1318,14 +1381,19 @@ async fn api_state(State(shared): State<Shared>) -> Json<Snapshot> {
 async fn api_traffic(State(shared): State<Shared>) -> Json<TrafficResponse> {
     let state = shared.runtime.read().await;
     let service_map = state.service_map.clone();
+    let history: Vec<TrafficDataPoint> = state.traffic_history.iter().cloned().collect();
     drop(state);
 
-    let services = read_bpf_traffic_stats(&shared, &service_map);
+    let (sys_total, services) = read_all_traffic_stats(&shared, &service_map);
 
-    let state = shared.runtime.read().await;
-    let history: Vec<TrafficDataPoint> = state.traffic_history.iter().cloned().collect();
-
-    Json(TrafficResponse { services, history })
+    Json(TrafficResponse {
+        system_bytes_sent: sys_total.0,
+        system_bytes_recv: sys_total.1,
+        system_packets_sent: sys_total.2,
+        system_packets_recv: sys_total.3,
+        services,
+        history,
+    })
 }
 
 // -- Config API: full policy --

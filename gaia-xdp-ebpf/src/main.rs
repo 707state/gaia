@@ -631,11 +631,11 @@ pub fn uretprobe_hotpatch_exit(ctx: RetProbeContext) -> u32 {
 
 // ── Traffic Monitoring Agent ──
 //
-// Hooks: kprobe on tcp_sendmsg, tcp_recvmsg, tcp_cleanup_rbuf
-// Role: Count bytes sent/received per PID for monitored service processes.
-// Only PIDs present in the SERVICE_PIDS map are tracked.
+// Hooks: kprobe on tcp_sendmsg, kretprobe on tcp_recvmsg
+// Role: Count bytes sent/received per TGID for ALL processes system-wide.
+// User-space aggregates by service using the service_map.
 
-/// kprobe on tcp_sendmsg — counts outbound bytes for monitored service PIDs.
+/// kprobe on tcp_sendmsg — counts outbound bytes for ALL processes.
 ///
 /// Prototype: int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 /// The `size` argument (3rd parameter) gives us the byte count.
@@ -644,16 +644,15 @@ pub fn kprobe_tcp_sendmsg(ctx: ProbeContext) -> u32 {
     let pid_tgid = bpf_get_current_pid_tgid();
     let tgid = (pid_tgid >> 32) as u32;
 
-    // Only track PIDs belonging to monitored services
-    if unsafe { SERVICE_PIDS.get(&tgid) }.is_none() {
-        return 0;
-    }
-
-    // 3rd argument = size (bytes to send)
-    let size: u64 = match ctx.arg::<u64>(2) {
-        Some(s) => s,
+    // 3rd argument = size (bytes to send). Read as usize to match kernel size_t.
+    let size: u64 = match ctx.arg::<usize>(2) {
+        Some(s) => s as u64,
         None => return 0,
     };
+    // Sanity check: single sendmsg should not exceed 64MB
+    if size > 64 * 1024 * 1024 {
+        return 0;
+    }
 
     if let Some(stats) = unsafe { TRAFFIC_STATS.get(&tgid) } {
         let updated = TrafficStats {
@@ -675,37 +674,26 @@ pub fn kprobe_tcp_sendmsg(ctx: ProbeContext) -> u32 {
     0
 }
 
-/// kprobe on tcp_recvmsg — counts inbound bytes for monitored service PIDs.
-///
-/// Prototype: int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, ...)
-/// The `len` argument (3rd parameter) gives us the requested byte count.
-/// We use kretprobe to get the actual bytes received from the return value.
+/// kprobe on tcp_recvmsg — no-op, actual counting done in kretprobe.
 #[kprobe]
 pub fn kprobe_tcp_recvmsg(_ctx: ProbeContext) -> u32 {
-    // We use the kretprobe to capture actual received bytes from the return value.
-    // This kprobe is a no-op placeholder to ensure the program is loaded.
     0
 }
 
 /// kretprobe on tcp_recvmsg — captures actual bytes received from return value.
-///
 /// Return value > 0 = number of bytes actually received.
-/// Return value <= 0 = error or no data.
 #[kretprobe]
 pub fn kretprobe_tcp_recvmsg(ctx: RetProbeContext) -> u32 {
     let pid_tgid = bpf_get_current_pid_tgid();
     let tgid = (pid_tgid >> 32) as u32;
 
-    // Only track PIDs belonging to monitored services
-    if unsafe { SERVICE_PIDS.get(&tgid) }.is_none() {
-        return 0;
-    }
-
     let ret: i64 = ctx.ret();
-    if ret <= 0 {
+    // tcp_recvmsg returns int (32-bit); mask to 32 bits to avoid aarch64 sign-extension issues
+    let ret32 = ret as i32;
+    if ret32 <= 0 {
         return 0;
     }
-    let bytes = ret as u64;
+    let bytes = ret32 as u64;
 
     if let Some(stats) = unsafe { TRAFFIC_STATS.get(&tgid) } {
         let updated = TrafficStats {

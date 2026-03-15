@@ -56,7 +56,7 @@ pub const MAX_PROCESS_TREE: u32 = 4096;
 /// Maximum tracked service PIDs (synced from user-space)
 pub const MAX_SERVICE_PIDS: u32 = 1024;
 /// Maximum per-PID traffic stats entries
-pub const MAX_TRAFFIC_STATS: u32 = 1024;
+pub const MAX_TRAFFIC_STATS: u32 = 65536;
 
 // ── Hotpatch guard modes ──
 
