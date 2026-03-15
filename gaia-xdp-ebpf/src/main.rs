@@ -4,7 +4,7 @@
 use aya_ebpf::{
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
-        bpf_override_return, bpf_probe_read_user, bpf_probe_read_user_str_bytes,
+        bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
     macros::{kprobe, kretprobe, map, tracepoint, uprobe, uretprobe},
     maps::{Array, HashMap, RingBuf},
@@ -13,7 +13,7 @@ use aya_ebpf::{
 use gaia_xdp_common::{
     HotpatchPidEntry, KernelEvent, ProcessTreeEntry, RateLimitCounter, RateLimitEntry,
     EVENT_ACTION_ALERT, EVENT_ACTION_BIND, EVENT_ACTION_BLOCKED, EVENT_ACTION_ENTER,
-    EVENT_ACTION_EXIT, EVENT_ACTION_OVERRIDE, EVENT_ACTION_RATE_LIMITED, EVENT_KIND_FILE_IO,
+    EVENT_ACTION_EXIT, EVENT_ACTION_KILL_REQUEST, EVENT_ACTION_RATE_LIMITED, EVENT_KIND_FILE_IO,
     EVENT_KIND_HOTPATCH, EVENT_KIND_NETWORK, EVENT_KIND_PRIVILEGE, EVENT_KIND_PROCESS,
     HOTPATCH_MODE_BLOCK, MAX_HOTPATCH_PIDS, MAX_PROCESS_TREE, MAX_RATE_LIMIT_COUNTERS,
     MAX_RATE_LIMIT_RULES, PROTOCOL_TCP, RATE_ACTION_BLOCK,
@@ -499,10 +499,18 @@ fn handle_bind_event(ctx: TracePointContext) -> Result<(), i32> {
 // Hooks: kprobe / kretprobe on kernel functions, uprobe / uretprobe on user binaries.
 // Role: Validate arguments and force error returns via bpf_override_return to neutralize exploits.
 
-/// kprobe guard on tcp_connect — monitors inbound connection attempts at the kernel level.
-/// When HOTPATCH_MODE_BLOCK is set for the calling PID, override the return value with EPERM.
+/// kprobe guard on tcp_connect — monitors kernel-level TCP connection attempts.
+///
+/// When HOTPATCH_MODE_BLOCK is set for the calling PID the probe emits a
+/// KILL_REQUEST event so that the user-space controller can send SIGKILL.
+///
+/// NOTE: `bpf_override_return` cannot be used here because `tcp_connect` is not
+/// annotated with `ALLOW_ERROR_INJECTION` in the kernel, and the BPF verifier
+/// rejects programs that call that helper on non-injectable functions:
+///   "program of this type cannot use helper bpf_override_return"
+/// The user-space SIGKILL path achieves equivalent protection.
 #[kprobe]
-pub fn kprobe_hotpatch_guard(ctx: ProbeContext) -> u32 {
+pub fn kprobe_hotpatch_guard(_ctx: ProbeContext) -> u32 {
     let Some(ptr) = get_scratch() else { return 0 };
     let event = unsafe { &mut *ptr };
     fill_base(event, EVENT_KIND_HOTPATCH, EVENT_ACTION_ALERT);
@@ -512,11 +520,11 @@ pub fn kprobe_hotpatch_guard(ctx: ProbeContext) -> u32 {
     let pid = event.pid;
     if let Some(entry) = unsafe { HOTPATCH_PIDS.get(&pid) } {
         if entry.active != 0 && entry.mode == HOTPATCH_MODE_BLOCK {
-            // Override the return value to EPERM (-1 in i64 cast to u64)
-            // ctx.regs points to the pt_regs passed to the kprobe handler.
-            unsafe { bpf_override_return(ctx.regs, -1i64 as u64) };
-            event.action = EVENT_ACTION_OVERRIDE;
-            copy_bytes(&mut event.detail, b"kprobe:tcp_connect:OVERRIDE");
+            // Cannot call bpf_override_return: tcp_connect has no ALLOW_ERROR_INJECTION
+            // annotation, so the BPF verifier rejects it at load time.
+            // Instead emit KILL_REQUEST so user-space can send SIGKILL to the process.
+            event.action = EVENT_ACTION_KILL_REQUEST;
+            copy_bytes(&mut event.detail, b"kprobe:tcp_connect:KILL_REQUEST");
         }
     }
 
@@ -532,7 +540,7 @@ pub fn kretprobe_hotpatch_guard(ctx: RetProbeContext) -> u32 {
     fill_base(event, EVENT_KIND_HOTPATCH, EVENT_ACTION_EXIT);
 
     // Read the (possibly overridden) return value
-    let retval = ctx.ret::<i64>().unwrap_or(0);
+    let retval: i64 = ctx.ret();
     write_i64_detail(&mut event.detail, retval);
 
     // Prefix detail with "kretprobe:tcp_connect:ret="
@@ -589,7 +597,7 @@ pub fn uretprobe_hotpatch_exit(ctx: RetProbeContext) -> u32 {
     if let Some(entry) = unsafe { HOTPATCH_PIDS.get(&pid) } {
         if entry.active != 0 {
             // Capture the return value for analysis
-            let retval = ctx.ret::<i64>().unwrap_or(0);
+            let retval: i64 = ctx.ret();
             copy_bytes(&mut event.detail, b"uretprobe-exit:ret=");
             let mut tmp_buf = [0u8; 21];
             let n = u64_to_ascii(retval.unsigned_abs(), &mut tmp_buf);

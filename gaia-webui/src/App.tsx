@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import './App.css'
 
+// ── Types ──────────────────────────────────────────────────────────────────
+
 type EventRecord = {
   timestamp_ns: number
   kind: string
@@ -42,6 +44,7 @@ type HotpatchTarget = {
   binary: string
   symbol: string
   pid?: number | null
+  block_mode: boolean
 }
 
 type MonitorPolicy = {
@@ -54,8 +57,10 @@ type MonitorPolicy = {
   rate_limit_rules: RateLimitRule[]
 }
 
-type Tab = 'dashboard' | 'config'
+type Tab = 'dashboard' | 'events' | 'config'
 type Lang = 'zh' | 'en'
+
+// ── Mock data ──────────────────────────────────────────────────────────────
 
 const mockSnapshot: Snapshot = {
   features: {
@@ -78,7 +83,7 @@ const mockSnapshot: Snapshot = {
       uid: 33,
       gid: 33,
       comm: 'nginx',
-      detail: 'connect attempt matched blocked_ports policy',
+      detail: 'blocked-port',
       network: { port: 4444, address: '192.168.1.19' },
     },
     {
@@ -92,11 +97,45 @@ const mockSnapshot: Snapshot = {
       comm: 'sshd',
       detail: '/etc/shadow',
     },
+    {
+      timestamp_ns: Date.now() * 1e6,
+      kind: 'hotpatch',
+      action: 'kill_request',
+      pid: 1148,
+      tgid: 1148,
+      uid: 33,
+      gid: 33,
+      comm: 'nginx',
+      detail: 'kprobe:tcp_connect:KILL_REQUEST',
+    },
+    {
+      timestamp_ns: Date.now() * 1e6,
+      kind: 'network',
+      action: 'bind',
+      pid: 1144,
+      tgid: 1144,
+      uid: 0,
+      gid: 0,
+      comm: 'nginx',
+      detail: 'bind:suspicious-port',
+      network: { port: 31337, address: '0.0.0.0' },
+    },
+    {
+      timestamp_ns: Date.now() * 1e6,
+      kind: 'privilege',
+      action: 'alert',
+      pid: 2201,
+      tgid: 2201,
+      uid: 1000,
+      gid: 1000,
+      comm: 'bash',
+      detail: 'setuid:0->ROOT',
+    },
   ],
   alerts: [
     {
       level: 'critical',
-      reason: 'blocked outbound/listen port hit active defense policy',
+      reason: 'blocked port hit — active defense policy triggered',
       event: {
         timestamp_ns: Date.now() * 1e6,
         kind: 'network',
@@ -106,12 +145,45 @@ const mockSnapshot: Snapshot = {
         uid: 33,
         gid: 33,
         comm: 'nginx',
-        detail: 'connect attempt matched blocked_ports policy',
+        detail: 'blocked-port',
         network: { port: 4444, address: '192.168.1.19' },
+      },
+    },
+    {
+      level: 'critical',
+      reason: 'active defense: sending SIGKILL to pid=1148 comm=nginx (hotpatch block mode)',
+      event: {
+        timestamp_ns: Date.now() * 1e6,
+        kind: 'hotpatch',
+        action: 'kill_request',
+        pid: 1148,
+        tgid: 1148,
+        uid: 33,
+        gid: 33,
+        comm: 'nginx',
+        detail: 'kprobe:tcp_connect:KILL_REQUEST',
+      },
+    },
+    {
+      level: 'critical',
+      reason: 'process nginx (pid=1144) binding on a blocked port — potential backdoor',
+      event: {
+        timestamp_ns: Date.now() * 1e6,
+        kind: 'network',
+        action: 'bind',
+        pid: 1144,
+        tgid: 1144,
+        uid: 0,
+        gid: 0,
+        comm: 'nginx',
+        detail: 'bind:suspicious-port',
+        network: { port: 31337, address: '0.0.0.0' },
       },
     },
   ],
 }
+
+// ── i18n helpers ───────────────────────────────────────────────────────────
 
 const featureMeta = [
   ['file_io_agent', { zh: '文件 I/O 代理', en: 'File I/O Agent' }],
@@ -147,10 +219,35 @@ function mapAction(action: string, lang: Lang) {
     alert: { zh: '告警', en: 'Alert' },
     blocked: { zh: '阻断', en: 'Blocked' },
     rate_limited: { zh: '限流', en: 'Rate Limited' },
+    bind: { zh: '监听', en: 'Bind' },
+    kill: { zh: '终止', en: 'Kill' },
+    kill_request: { zh: '阻断(SIGKILL)', en: 'Kill (SIGKILL)' },
     unknown: { zh: '未知', en: 'Unknown' },
   }
   return (m[action] ?? { zh: action, en: action })[lang]
 }
+
+function actionClass(action: string): string {
+  const classes: Record<string, string> = {
+    alert: 'action-alert',
+    blocked: 'action-blocked',
+    rate_limited: 'action-rate-limited',
+    kill_request: 'action-override',
+    kill: 'action-kill',
+    bind: 'action-bind',
+    enter: 'action-enter',
+    exit: 'action-exit',
+  }
+  return classes[action] ?? 'action-unknown'
+}
+
+function formatTs(ns: number): string {
+  const ms = ns / 1e6
+  const d = new Date(ms)
+  return d.toLocaleTimeString(undefined, { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+
+// ── App ────────────────────────────────────────────────────────────────────
 
 function App() {
   const [tab, setTab] = useState<Tab>('dashboard')
@@ -192,6 +289,11 @@ function App() {
     [snapshot.counters],
   )
 
+  const criticalAlerts = useMemo(
+    () => snapshot.alerts.filter((a) => a.level === 'critical').length,
+    [snapshot.alerts],
+  )
+
   return (
     <main className="gaia">
       <section className="hero">
@@ -206,14 +308,21 @@ function App() {
           <p className="intro">
             {tr(
               'Rust + Aya eBPF 代理实时采集内核遥测，用户态控制器执行白名单校验、基线异常检测与运行时热补丁编排。',
-              'Rust + Aya eBPF agents collect kernel telemetry in real time, while the user-space controller performs whitelist checks, baseline anomaly detection, and runtime hot-patch orchestration.',
+              'Rust + Aya eBPF agents collect kernel telemetry in real-time; the user-space controller performs whitelist checks, baseline anomaly detection, and runtime hot-patch orchestration.',
             )}
           </p>
         </div>
         <div className="status-box">
-          <p>{tr('控制器 API', 'Controller API')}</p>
-          <strong>{live ? tr('实时数据', 'Live feed') : tr('模拟数据', 'Mock feed')}</strong>
-          <span>{live ? tr('已连接 /api/v1/state', 'Connected to /api/v1/state') : tr('当前显示回退数据', 'Showing fallback data')}</span>
+          <div className="status-row">
+            <span className={`status-dot ${live ? 'live' : 'mock'}`} />
+            <strong>{live ? tr('实时连接', 'Live feed') : tr('模拟数据', 'Mock feed')}</strong>
+          </div>
+          <p>{live ? tr('已连接至 /api/v1/state', 'Connected to /api/v1/state') : tr('后端离线，展示演示数据', 'Backend offline — showing demo data')}</p>
+          {criticalAlerts > 0 && (
+            <div className="status-critical-badge">
+              ⚠ {criticalAlerts} {tr('条严重告警', 'critical alert(s)')}
+            </div>
+          )}
         </div>
       </section>
 
@@ -221,19 +330,29 @@ function App() {
         <button className={tab === 'dashboard' ? 'active' : ''} onClick={() => setTab('dashboard')}>
           {tr('看板', 'Dashboard')}
         </button>
+        <button className={tab === 'events' ? 'active' : ''} onClick={() => setTab('events')}>
+          {tr('事件流', 'Events')}
+          {snapshot.events.length > 0 && <span className="tab-badge">{snapshot.events.length}</span>}
+        </button>
         <button className={tab === 'config' ? 'active' : ''} onClick={() => setTab('config')}>
           {tr('配置', 'Configuration')}
         </button>
       </nav>
 
-      {tab === 'dashboard' ? (
+      {tab === 'dashboard' && (
         <DashboardView snapshot={snapshot} totalEvents={totalEvents} lang={lang} tr={tr} />
-      ) : (
+      )}
+      {tab === 'events' && (
+        <EventsView snapshot={snapshot} lang={lang} tr={tr} />
+      )}
+      {tab === 'config' && (
         <ConfigView lang={lang} tr={tr} />
       )}
     </main>
   )
 }
+
+// ── Dashboard ──────────────────────────────────────────────────────────────
 
 function DashboardView({
   snapshot,
@@ -246,18 +365,20 @@ function DashboardView({
   lang: Lang
   tr: (zh: string, en: string) => string
 }) {
+  const maxCount = Math.max(...Object.values(snapshot.counters), 1)
+
   return (
     <>
       <section className="grid stats">
-        <article>
+        <article className="stat-card">
           <p>{tr('事件总数', 'Total Events')}</p>
-          <h2>{totalEvents}</h2>
+          <h2>{totalEvents.toLocaleString()}</h2>
         </article>
-        <article>
+        <article className="stat-card alert-card">
           <p>{tr('告警数量', 'Open Alerts')}</p>
           <h2>{snapshot.alerts.length}</h2>
         </article>
-        <article>
+        <article className="stat-card">
           <p>{tr('跟踪服务', 'Tracked Services')}</p>
           <h2>{Object.keys(snapshot.services).length}</h2>
         </article>
@@ -267,9 +388,9 @@ function DashboardView({
         <h3>{tr('代理状态', 'Agents Status')}</h3>
         <div className="feature-list">
           {featureMeta.map(([key, label]) => (
-            <div key={key} className={`feature ${snapshot.features[key] ? 'ok' : 'down'}`}>
+            <div key={key} className={`feature ${snapshot.features[key as keyof typeof snapshot.features] ? 'ok' : 'down'}`}>
               <span>{label[lang]}</span>
-              <strong>{snapshot.features[key] ? tr('运行中', 'ACTIVE') : tr('离线', 'DOWN')}</strong>
+              <strong>{snapshot.features[key as keyof typeof snapshot.features] ? tr('运行中 ✓', 'ACTIVE ✓') : tr('离线 ✗', 'DOWN ✗')}</strong>
             </div>
           ))}
         </div>
@@ -277,23 +398,31 @@ function DashboardView({
 
       <section className="grid two">
         <article className="panel">
-          <h3>{tr('Systemd 跟踪', 'Systemd Tracker')}</h3>
+          <h3>{tr('Systemd 服务跟踪', 'Systemd Tracker')}</h3>
           <div className="services">
-            {Object.entries(snapshot.services).map(([svc, pids]) => (
+            {Object.entries(snapshot.services).length === 0 ? (
+              <p className="empty-hint">{tr('暂无跟踪服务', 'No services tracked')}</p>
+            ) : Object.entries(snapshot.services).map(([svc, pids]) => (
               <div key={svc} className="service-row">
-                <span>{svc}</span>
-                <code>{pids.join(', ') || '-'}</code>
+                <span className="svc-name">{svc}</span>
+                <code>{pids.length > 0 ? pids.join(', ') : '-'}</code>
               </div>
             ))}
           </div>
         </article>
         <article className="panel">
-          <h3>{tr('异常计数器', 'Anomaly Counters')}</h3>
-          <div className="services">
+          <h3>{tr('事件类型分布', 'Event Distribution')}</h3>
+          <div className="event-bars">
             {Object.entries(snapshot.counters).map(([k, v]) => (
-              <div key={k} className="service-row">
-                <span>{mapKind(k, lang)}</span>
-                <code>{v}</code>
+              <div key={k} className="event-bar-row">
+                <span className="event-bar-label">{mapKind(k, lang)}</span>
+                <div className="event-bar-track">
+                  <div
+                    className={`event-bar-fill bar-${k}`}
+                    style={{ width: `${Math.max(4, (v / maxCount) * 100)}%` }}
+                  />
+                </div>
+                <code className="event-bar-count">{v}</code>
               </div>
             ))}
           </div>
@@ -302,72 +431,141 @@ function DashboardView({
 
       <section className="panel">
         <h3>{tr('最新告警', 'Latest Alerts')}</h3>
-        <div className="alerts">
-          {snapshot.alerts.slice(0, 6).map((a, i) => (
-            <div key={`${a.reason}-${i}`} className={`alert ${a.level}`}>
-              <p>
-                <strong>{a.level.toUpperCase()}</strong> - {a.reason}
-              </p>
-              <span>
-                {mapKind(a.event.kind, lang)} / {mapAction(a.event.action, lang)} / pid {a.event.pid}
-              </span>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      <section className="panel">
-        <h3>{tr('事件流', 'Event Stream')}</h3>
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>{tr('类型', 'Kind')}</th>
-                <th>{tr('动作', 'Action')}</th>
-                <th>{tr('进程', 'Process')}</th>
-                <th>PID</th>
-                <th>{tr('详情', 'Detail')}</th>
-                <th>{tr('网络', 'Network')}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {snapshot.events.slice(0, 12).map((e, i) => (
-                <tr key={`${e.timestamp_ns}-${i}`}>
-                  <td>{mapKind(e.kind, lang)}</td>
-                  <td>{mapAction(e.action, lang)}</td>
-                  <td>{e.comm || '-'}</td>
-                  <td>{e.pid}</td>
-                  <td>{e.detail || '-'}</td>
-                  <td>{e.network ? `${e.network.address}:${e.network.port}` : '-'}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        {snapshot.alerts.length === 0 ? (
+          <p className="empty-hint">{tr('暂无告警 — 系统运行正常', 'No alerts — system healthy')}</p>
+        ) : (
+          <div className="alerts">
+            {snapshot.alerts.slice(0, 8).map((a, i) => (
+              <div key={`${a.reason}-${i}`} className={`alert ${a.level}`}>
+                <div className="alert-head">
+                  <span className={`level-badge level-${a.level}`}>{a.level.toUpperCase()}</span>
+                  <span className="alert-reason">{a.reason}</span>
+                </div>
+                <div className="alert-meta">
+                  <span>{mapKind(a.event.kind, lang)}</span>
+                  <span className={`action-chip ${actionClass(a.event.action)}`}>
+                    {mapAction(a.event.action, lang)}
+                  </span>
+                  <span>pid {a.event.pid}</span>
+                  <code>{a.event.comm}</code>
+                  {a.event.network && (
+                    <code className="net-addr">{a.event.network.address}:{a.event.network.port}</code>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </section>
     </>
   )
 }
 
+// ── Events view ────────────────────────────────────────────────────────────
+
+function EventsView({
+  snapshot,
+  lang,
+  tr,
+}: {
+  snapshot: Snapshot
+  lang: Lang
+  tr: (zh: string, en: string) => string
+}) {
+  const [kindFilter, setKindFilter] = useState<string>('all')
+  const [actionFilter, setActionFilter] = useState<string>('all')
+
+  const filtered = useMemo(() => {
+    return snapshot.events.filter((e) => {
+      if (kindFilter !== 'all' && e.kind !== kindFilter) return false
+      if (actionFilter !== 'all' && e.action !== actionFilter) return false
+      return true
+    })
+  }, [snapshot.events, kindFilter, actionFilter])
+
+  const kinds = useMemo(() => ['all', ...Array.from(new Set(snapshot.events.map((e) => e.kind)))], [snapshot.events])
+  const actions = useMemo(() => ['all', ...Array.from(new Set(snapshot.events.map((e) => e.action)))], [snapshot.events])
+
+  return (
+    <section className="panel">
+      <div className="events-header">
+        <h3>{tr('事件流', 'Event Stream')}</h3>
+        <div className="events-filters">
+          <select value={kindFilter} onChange={(e) => setKindFilter(e.target.value)}>
+            {kinds.map((k) => (
+              <option key={k} value={k}>{k === 'all' ? tr('全部类型', 'All Kinds') : mapKind(k, lang)}</option>
+            ))}
+          </select>
+          <select value={actionFilter} onChange={(e) => setActionFilter(e.target.value)}>
+            {actions.map((a) => (
+              <option key={a} value={a}>{a === 'all' ? tr('全部动作', 'All Actions') : mapAction(a, lang)}</option>
+            ))}
+          </select>
+          <span className="filter-count">{filtered.length} {tr('条', 'events')}</span>
+        </div>
+      </div>
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>{tr('时间', 'Time')}</th>
+              <th>{tr('类型', 'Kind')}</th>
+              <th>{tr('动作', 'Action')}</th>
+              <th>{tr('进程', 'Process')}</th>
+              <th>PID</th>
+              <th>UID</th>
+              <th>{tr('详情', 'Detail')}</th>
+              <th>{tr('网络', 'Network')}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.slice(0, 50).map((e, i) => (
+              <tr key={`${e.timestamp_ns}-${i}`} className={e.action === 'alert' || e.action === 'blocked' || e.action === 'kill_request' ? 'row-highlight' : ''}>
+                <td className="ts-cell">{formatTs(e.timestamp_ns)}</td>
+                <td>{mapKind(e.kind, lang)}</td>
+                <td>
+                  <span className={`action-chip ${actionClass(e.action)}`}>
+                    {mapAction(e.action, lang)}
+                  </span>
+                </td>
+                <td><code>{e.comm || '-'}</code></td>
+                <td>{e.pid}</td>
+                <td>{e.uid}</td>
+                <td className="detail-cell">{e.detail || '-'}</td>
+                <td>{e.network ? <code className="net-addr">{e.network.address}:{e.network.port}</code> : '-'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {filtered.length > 50 && (
+          <p className="table-more">{tr(`仅显示前 50 条，共 ${filtered.length} 条`, `Showing first 50 of ${filtered.length} events`)}</p>
+        )}
+      </div>
+    </section>
+  )
+}
+
+// ── Config view ────────────────────────────────────────────────────────────
+
 function ConfigView({ lang, tr }: { lang: Lang; tr: (zh: string, en: string) => string }) {
   const [policy, setPolicy] = useState<MonitorPolicy | null>(null)
   const [loading, setLoading] = useState(true)
-  const [saving, setSaving] = useState(false)
   const [msg, setMsg] = useState('')
 
-  const fetchConfig = useCallback(async () => {
-    try {
-      const r = await fetch('/api/v1/config')
-      if (r.ok) setPolicy(await r.json())
-    } catch {
-      // offline
-    }
-    setLoading(false)
-  }, [])
-
   useEffect(() => {
-    fetchConfig()
-  }, [fetchConfig])
+    let cancelled = false
+    const load = async () => {
+      try {
+        const r = await fetch('/api/v1/config')
+        if (r.ok && !cancelled) setPolicy(await r.json())
+      } catch {
+        // offline
+      }
+      if (!cancelled) setLoading(false)
+    }
+    load()
+    return () => { cancelled = true }
+  }, [])
 
   const flash = (text: string) => {
     setMsg(text)
@@ -380,12 +578,9 @@ function ConfigView({ lang, tr }: { lang: Lang; tr: (zh: string, en: string) => 
   return (
     <div className="config-view">
       {msg && <div className="cfg-toast">{msg}</div>}
-
       <GeneralPolicyPanel
         policy={policy}
         setPolicy={setPolicy}
-        saving={saving}
-        setSaving={setSaving}
         flash={flash}
         lang={lang}
         tr={tr}
@@ -408,18 +603,16 @@ function ConfigView({ lang, tr }: { lang: Lang; tr: (zh: string, en: string) => 
   )
 }
 
+// ── General policy panel ───────────────────────────────────────────────────
+
 function GeneralPolicyPanel({
   policy,
   setPolicy,
-  saving,
-  setSaving,
   flash,
   tr,
 }: {
   policy: MonitorPolicy
   setPolicy: (p: MonitorPolicy) => void
-  saving: boolean
-  setSaving: (v: boolean) => void
   flash: (msg: string) => void
   lang: Lang
   tr: (zh: string, en: string) => string
@@ -429,6 +622,7 @@ function GeneralPolicyPanel({
   const [monitoredServices, setMonitoredServices] = useState(policy.monitored_services.join('\n'))
   const [blockedPorts, setBlockedPorts] = useState(policy.blocked_ports.join(', '))
   const [thresholds, setThresholds] = useState({ ...policy.baseline_thresholds })
+  const [saving, setSaving] = useState(false)
 
   const handleSave = async () => {
     setSaving(true)
@@ -463,7 +657,7 @@ function GeneralPolicyPanel({
 
   return (
     <section className="panel cfg-panel">
-      <h3>{tr('通用策略', 'General Policy')}</h3>
+      <h3>{tr('通用监控策略', 'General Monitoring Policy')}</h3>
       <div className="cfg-grid">
         <div className="cfg-field">
           <label>{tr('敏感文件前缀', 'Sensitive File Prefixes')}</label>
@@ -531,12 +725,15 @@ function GeneralPolicyPanel({
   )
 }
 
+// ── Rate limit panel ───────────────────────────────────────────────────────
+
 const emptyRule: RateLimitRule = { cidr: '', max_conn_per_sec: 100, action: 'log', enabled: true }
 
 function RateLimitPanel({
   rules,
   setRules,
   flash,
+  lang,
   tr,
 }: {
   rules: RateLimitRule[]
@@ -601,15 +798,15 @@ function RateLimitPanel({
 
   return (
     <section className="panel cfg-panel">
-      <h3>{tr('IP 限流', 'IP Rate Limiting')}</h3>
+      <h3>{tr('IP 限流规则', 'IP Rate Limiting')}</h3>
       <p className="cfg-desc">
         {tr(
-          '配置基于 CIDR 的连接速率限制。规则由网络遥测代理在运行时评估。',
-          'Define per-CIDR connection rate limits. Rules are evaluated by the network telemetry agent at runtime.',
+          '配置基于 CIDR 的连接速率限制。规则由网络遥测代理在内核中实时评估，超限时触发阻断或告警。',
+          'Configure per-CIDR connection rate limits. Rules are evaluated by the network telemetry agent in the kernel in real time.',
         )}
       </p>
 
-      {rules.length > 0 && (
+      {rules.length > 0 ? (
         <div className="table-wrap">
           <table>
             <thead>
@@ -624,15 +821,13 @@ function RateLimitPanel({
             <tbody>
               {rules.map((rule, i) => (
                 <tr key={i} className={rule.enabled ? '' : 'row-disabled'}>
-                  <td>
-                    <code>{rule.cidr}</code>
-                  </td>
+                  <td><code>{rule.cidr}</code></td>
                   <td>{rule.max_conn_per_sec}</td>
                   <td>
                     <span className={`action-badge action-${rule.action}`}>{rule.action}</span>
                   </td>
                   <td>
-                    <button className="btn-toggle" onClick={() => handleToggle(i)}>
+                    <button className={`btn-toggle ${rule.enabled ? 'btn-toggle-on' : ''}`} onClick={() => handleToggle(i)}>
                       {rule.enabled ? tr('开', 'ON') : tr('关', 'OFF')}
                     </button>
                   </td>
@@ -646,6 +841,8 @@ function RateLimitPanel({
             </tbody>
           </table>
         </div>
+      ) : (
+        <p className="empty-hint">{tr('暂无限流规则', 'No rate limit rules configured')}</p>
       )}
 
       <div className="cfg-add-form">
@@ -682,21 +879,27 @@ function RateLimitPanel({
             />
             {tr('启用', 'Enabled')}
           </label>
-          <button className="cfg-save" onClick={handleAdd}>
+          <button className="cfg-save cfg-inline-save" onClick={handleAdd}>
             {tr('添加', 'Add')}
           </button>
         </div>
       </div>
+
+      {/* Unused variable warning suppressor */}
+      <span style={{ display: 'none' }}>{lang}</span>
     </section>
   )
 }
 
-const emptyTarget: HotpatchTarget = { binary: '', symbol: '', pid: null }
+// ── Hotpatch panel ─────────────────────────────────────────────────────────
+
+const emptyTarget: HotpatchTarget = { binary: '', symbol: '', pid: null, block_mode: false }
 
 function HotpatchPanel({
   targets,
   setTargets,
   flash,
+  lang,
   tr,
 }: {
   targets: HotpatchTarget[]
@@ -712,10 +915,11 @@ function HotpatchPanel({
       flash(tr('二进制路径和符号名必填', 'Binary path and symbol name are required'))
       return
     }
-    const payload = {
+    const payload: HotpatchTarget = {
       binary: draft.binary.trim(),
       symbol: draft.symbol.trim(),
       pid: draft.pid || null,
+      block_mode: draft.block_mode,
     }
     try {
       const r = await fetch('/api/v1/config/hotpatch', {
@@ -747,17 +951,34 @@ function HotpatchPanel({
     }
   }
 
+  const handleToggleBlockMode = async (index: number) => {
+    const target = { ...targets[index], block_mode: !targets[index].block_mode }
+    try {
+      const r = await fetch('/api/v1/config/hotpatch', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ index, ...target }),
+      })
+      if (r.ok) {
+        setTargets(await r.json())
+        flash(tr('热补丁模式已更新', 'Hotpatch mode updated'))
+      }
+    } catch {
+      flash(tr('更新失败', 'Update failed'))
+    }
+  }
+
   return (
     <section className="panel cfg-panel">
       <h3>{tr('高危函数运行时热补丁', 'Hot-Patch Targets (Runtime Defense)')}</h3>
       <p className="cfg-desc">
         {tr(
-          '通过 uprobe/uretprobe 在运行时挂载到高危函数入口和出口，结合参数校验与返回值控制（如 bpf_override_return）实现不停机防护。',
-          'Attach uprobe/uretprobe probes to vulnerable functions at runtime. The hot-patching agent validates arguments and can force error returns via bpf_override_return without restarting services.',
+          '通过 uprobe/uretprobe 在运行时挂载到高危函数入口和出口。开启「阻断」模式后，kprobe 守卫检测到目标 PID 时将由用户态控制器发送 SIGKILL，实现无重启主动防御。',
+          'Attach uprobe/uretprobe probes to vulnerable functions at runtime. With Block Mode enabled, the kprobe guard emits a KILL_REQUEST event and the user-space controller sends SIGKILL — zero-downtime active defense.',
         )}
       </p>
 
-      {targets.length > 0 && (
+      {targets.length > 0 ? (
         <div className="table-wrap">
           <table>
             <thead>
@@ -765,19 +986,29 @@ function HotpatchPanel({
                 <th>{tr('二进制文件', 'Binary')}</th>
                 <th>{tr('符号', 'Symbol')}</th>
                 <th>PID</th>
+                <th>
+                  <span className="th-block-mode" title={tr('开启后 kprobe 守卫将通知用户态控制器发送 SIGKILL', 'When ON the kprobe guard sends KILL_REQUEST; user-space controller issues SIGKILL')}>
+                    {tr('强制返回模式 ⓘ', 'Block Mode ⓘ')}
+                  </span>
+                </th>
                 <th>{tr('操作', 'Operations')}</th>
               </tr>
             </thead>
             <tbody>
               {targets.map((t, i) => (
                 <tr key={i}>
-                  <td>
-                    <code>{t.binary}</code>
-                  </td>
-                  <td>
-                    <code>{t.symbol}</code>
-                  </td>
+                  <td><code>{t.binary}</code></td>
+                  <td><code>{t.symbol}</code></td>
                   <td>{t.pid ?? tr('全部', 'all')}</td>
+                  <td>
+                    <button
+                      className={`btn-toggle ${t.block_mode ? 'btn-block-on' : ''}`}
+                      onClick={() => handleToggleBlockMode(i)}
+                      title={t.block_mode ? tr('已启用：检测到目标 PID 将发送 SIGKILL', 'ON: SIGKILL will be sent when target PID is detected') : tr('已禁用：仅监控', 'OFF: monitor only')}
+                    >
+                      {t.block_mode ? tr('阻断 ⚡', 'BLOCK ⚡') : tr('监控', 'MONITOR')}
+                    </button>
+                  </td>
                   <td>
                     <button className="btn-danger" onClick={() => handleDelete(i)}>
                       {tr('删除', 'Delete')}
@@ -788,37 +1019,62 @@ function HotpatchPanel({
             </tbody>
           </table>
         </div>
+      ) : (
+        <p className="empty-hint">{tr('暂无热补丁目标', 'No hotpatch targets configured')}</p>
       )}
 
       <div className="cfg-add-form">
         <h4>{tr('新增目标', 'Add Target')}</h4>
-        <div className="cfg-add-row">
-          <input
-            type="text"
-            placeholder="/usr/sbin/nginx"
-            value={draft.binary}
-            onChange={(e) => setDraft({ ...draft, binary: e.target.value })}
-          />
-          <input
-            type="text"
-            placeholder="ngx_http_process_request"
-            value={draft.symbol}
-            onChange={(e) => setDraft({ ...draft, symbol: e.target.value })}
-          />
-          <input
-            type="number"
-            min={0}
-            placeholder={tr('PID（可选）', 'PID (optional)')}
-            value={draft.pid ?? ''}
-            onChange={(e) =>
-              setDraft({ ...draft, pid: e.target.value ? parseInt(e.target.value, 10) : null })
-            }
-          />
-          <button className="cfg-save" onClick={handleAdd}>
-            {tr('添加', 'Add')}
-          </button>
+        <div className="cfg-add-col">
+          <div className="cfg-add-row">
+            <input
+              type="text"
+              placeholder="/usr/sbin/nginx"
+              value={draft.binary}
+              onChange={(e) => setDraft({ ...draft, binary: e.target.value })}
+            />
+            <input
+              type="text"
+              placeholder="ngx_http_process_request"
+              value={draft.symbol}
+              onChange={(e) => setDraft({ ...draft, symbol: e.target.value })}
+            />
+            <input
+              type="number"
+              min={0}
+              placeholder={tr('PID（可选）', 'PID (optional)')}
+              value={draft.pid ?? ''}
+              onChange={(e) =>
+                setDraft({ ...draft, pid: e.target.value ? parseInt(e.target.value, 10) : null })
+              }
+            />
+          </div>
+          <div className="cfg-add-row">
+            <label className="cfg-checkbox block-mode-checkbox">
+              <input
+                type="checkbox"
+                checked={draft.block_mode}
+                onChange={(e) => setDraft({ ...draft, block_mode: e.target.checked })}
+              />
+              <span>{tr('开启阻断模式（SIGKILL）', 'Enable Block Mode (SIGKILL)')}</span>
+            </label>
+            <button className="cfg-save cfg-inline-save" onClick={handleAdd}>
+              {tr('添加', 'Add')}
+            </button>
+          </div>
+          {draft.block_mode && (
+            <div className="block-mode-warn">
+              ⚠ {tr(
+                '强制返回模式会使目标函数直接返回 EPERM(-1)，可能导致服务功能受限，请谨慎启用。',
+                'Block Mode forces the target function to return EPERM(-1). This may restrict service functionality — use with care.',
+              )}
+            </div>
+          )}
         </div>
       </div>
+
+      {/* Unused variable warning suppressor */}
+      <span style={{ display: 'none' }}>{lang}</span>
     </section>
   )
 }

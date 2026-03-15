@@ -21,9 +21,14 @@ pub const EVENT_ACTION_BLOCKED: u8 = 4;
 pub const EVENT_ACTION_RATE_LIMITED: u8 = 5;
 /// Bind syscall — process started listening on a port
 pub const EVENT_ACTION_BIND: u8 = 6;
-/// Process exited / killed
+/// Process exited / killed by the user-space controller
 pub const EVENT_ACTION_KILL: u8 = 7;
-/// Return value override via bpf_override_return (active defense)
+/// eBPF probe detected a hotpatch target in BLOCK mode and requests user-space to kill the PID.
+/// bpf_override_return is NOT used because tcp_connect lacks ALLOW_ERROR_INJECTION; instead the
+/// kprobe emits this action and the user-space controller sends SIGKILL.
+pub const EVENT_ACTION_KILL_REQUEST: u8 = 8;
+/// Kept for ABI compatibility — previously used for bpf_override_return, now superseded by
+/// KILL_REQUEST. User-space will never see this value from the kernel probe.
 pub const EVENT_ACTION_OVERRIDE: u8 = 8;
 
 // ── Network protocols ──

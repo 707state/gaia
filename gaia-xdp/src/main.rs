@@ -22,10 +22,11 @@ use aya::{
 };
 use clap::Parser;
 use gaia_xdp_common::{
-    EVENT_ACTION_ALERT, EVENT_ACTION_BIND, EVENT_ACTION_BLOCKED, EVENT_ACTION_OVERRIDE,
+    EVENT_ACTION_ALERT, EVENT_ACTION_BIND, EVENT_ACTION_BLOCKED, EVENT_ACTION_KILL_REQUEST,
     EVENT_ACTION_RATE_LIMITED, EVENT_KIND_FILE_IO, EVENT_KIND_HOTPATCH, EVENT_KIND_NETWORK,
     EVENT_KIND_PRIVILEGE, EVENT_KIND_PROCESS, HotpatchPidEntry, KernelEvent, RateLimitEntry,
 };
+use libc;
 use log::{info, warn};
 use object::{Object, ObjectSymbol};
 use serde::{Deserialize, Serialize};
@@ -787,18 +788,24 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
         );
     }
 
-    // Hotpatch override: bpf_override_return was triggered
-    if event.kind == EVENT_KIND_HOTPATCH && event.action == EVENT_ACTION_OVERRIDE {
+    // Active defense: kprobe detected BLOCK-mode PID — kill the process.
+    // bpf_override_return is not used because tcp_connect lacks ALLOW_ERROR_INJECTION;
+    // the BPF probe emits KILL_REQUEST and we enforce the kill here.
+    let kill_pid = if event.kind == EVENT_KIND_HOTPATCH && event.action == EVENT_ACTION_KILL_REQUEST {
+        let pid = record.pid;
         push_alert(
             &mut state,
             "critical",
             format!(
-                "active defense: bpf_override_return executed for pid={} comm={}",
-                record.pid, record.comm
+                "active defense: sending SIGKILL to pid={} comm={} (hotpatch block mode)",
+                pid, record.comm
             ),
             &record,
         );
-    }
+        Some(pid)
+    } else {
+        None
+    };
 
     // Hotpatch blocked uprobe (PID-filtered)
     if event.kind == EVENT_KIND_HOTPATCH && event.action == EVENT_ACTION_BLOCKED {
@@ -816,6 +823,32 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
     state.events.push_front(record);
     while state.events.len() > MAX_EVENT_HISTORY {
         state.events.pop_back();
+    }
+
+    // Drop locks before issuing kill to avoid holding write-lock during syscall.
+    drop(state);
+    drop(policy);
+    if let Some(pid) = kill_pid {
+        kill_process(pid);
+    }
+}
+
+// ── Active defense: SIGKILL ──
+
+/// Send SIGKILL to a process identified by `pid`.
+///
+/// This is the enforcement path for hotpatch BLOCK mode.  Because
+/// `bpf_override_return` requires `ALLOW_ERROR_INJECTION` on the target
+/// kernel function (which `tcp_connect` does not have), the eBPF probe
+/// instead emits a `KILL_REQUEST` event and delegates the actual kill here.
+fn kill_process(pid: u32) {
+    // SAFETY: kill(2) is always safe to call with a valid pid and SIGKILL.
+    let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    if ret == 0 {
+        info!("active defense: SIGKILL sent to pid={pid}");
+    } else {
+        let errno = unsafe { *libc::__errno_location() };
+        warn!("active defense: kill(pid={pid}, SIGKILL) failed errno={errno}");
     }
 }
 
@@ -898,7 +931,7 @@ fn action_name(action: u8) -> &'static str {
         5 => "rate_limited",
         6 => "bind",
         7 => "kill",
-        8 => "override",
+        8 => "kill_request",
         _ => "unknown",
     }
 }
