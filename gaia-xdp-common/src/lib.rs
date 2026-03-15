@@ -4,29 +4,54 @@ pub const DETAIL_LEN: usize = 128;
 pub const COMM_LEN: usize = 16;
 pub const ADDR_LEN: usize = 16;
 
+// ── Event kinds ──
+
 pub const EVENT_KIND_FILE_IO: u8 = 1;
 pub const EVENT_KIND_PROCESS: u8 = 2;
 pub const EVENT_KIND_PRIVILEGE: u8 = 3;
 pub const EVENT_KIND_NETWORK: u8 = 4;
 pub const EVENT_KIND_HOTPATCH: u8 = 5;
 
+// ── Event actions ──
+
 pub const EVENT_ACTION_ENTER: u8 = 1;
 pub const EVENT_ACTION_EXIT: u8 = 2;
 pub const EVENT_ACTION_ALERT: u8 = 3;
 pub const EVENT_ACTION_BLOCKED: u8 = 4;
 pub const EVENT_ACTION_RATE_LIMITED: u8 = 5;
+/// Bind syscall — process started listening on a port
+pub const EVENT_ACTION_BIND: u8 = 6;
+/// Process exited / killed
+pub const EVENT_ACTION_KILL: u8 = 7;
+/// Return value override via bpf_override_return (active defense)
+pub const EVENT_ACTION_OVERRIDE: u8 = 8;
+
+// ── Network protocols ──
 
 pub const PROTOCOL_UNKNOWN: u8 = 0;
 pub const PROTOCOL_TCP: u8 = 6;
 pub const PROTOCOL_UDP: u8 = 17;
 
+// ── Rate limit actions ──
+
 pub const RATE_ACTION_LOG: u8 = 0;
 pub const RATE_ACTION_BLOCK: u8 = 1;
 pub const RATE_ACTION_THROTTLE: u8 = 2;
 
+// ── Map capacity limits ──
+
 pub const MAX_RATE_LIMIT_RULES: u32 = 64;
 pub const MAX_RATE_LIMIT_COUNTERS: u32 = 65536;
 pub const MAX_HOTPATCH_PIDS: u32 = 256;
+/// Maximum entries in the process parent map (PID → PPID)
+pub const MAX_PROCESS_TREE: u32 = 4096;
+
+// ── Hotpatch guard modes ──
+
+/// kprobe guard: only log / alert, do not override return
+pub const HOTPATCH_MODE_MONITOR: u8 = 0;
+/// kprobe guard: override return value with EPERM (-1) via bpf_override_return
+pub const HOTPATCH_MODE_BLOCK: u8 = 1;
 
 /// A CIDR-based rate limit rule stored in BPF HashMap.
 /// Key: rule index (u32). Value: this struct.
@@ -64,7 +89,24 @@ pub struct RateLimitCounter {
 pub struct HotpatchPidEntry {
     /// 1 = active, 0 = inactive
     pub active: u8,
-    pub _pad: [u8; 3],
+    /// Guard mode: HOTPATCH_MODE_MONITOR or HOTPATCH_MODE_BLOCK
+    pub mode: u8,
+    pub _pad: [u8; 2],
+}
+
+/// Process parent entry for process-tree tracking.
+/// Key: child PID (u32). Value: this struct.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ProcessTreeEntry {
+    /// Parent PID
+    pub ppid: u32,
+    /// Creator UID at the time of execve
+    pub uid: u32,
+    /// Timestamp of the execve event (ns)
+    pub timestamp_ns: u64,
+    /// Executable name (first COMM_LEN bytes)
+    pub comm: [u8; COMM_LEN],
 }
 
 #[repr(C)]
@@ -114,4 +156,5 @@ mod pod_impls {
     unsafe impl aya::Pod for RateLimitCounter {}
     unsafe impl aya::Pod for HotpatchPidEntry {}
     unsafe impl aya::Pod for KernelEvent {}
+    unsafe impl aya::Pod for ProcessTreeEntry {}
 }

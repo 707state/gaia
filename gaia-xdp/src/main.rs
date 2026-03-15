@@ -22,9 +22,9 @@ use aya::{
 };
 use clap::Parser;
 use gaia_xdp_common::{
-    EVENT_ACTION_ALERT, EVENT_ACTION_BLOCKED, EVENT_ACTION_RATE_LIMITED,
-    EVENT_KIND_FILE_IO, EVENT_KIND_HOTPATCH, EVENT_KIND_NETWORK, EVENT_KIND_PRIVILEGE,
-    EVENT_KIND_PROCESS, HotpatchPidEntry, KernelEvent, RateLimitEntry,
+    EVENT_ACTION_ALERT, EVENT_ACTION_BIND, EVENT_ACTION_BLOCKED, EVENT_ACTION_OVERRIDE,
+    EVENT_ACTION_RATE_LIMITED, EVENT_KIND_FILE_IO, EVENT_KIND_HOTPATCH, EVENT_KIND_NETWORK,
+    EVENT_KIND_PRIVILEGE, EVENT_KIND_PROCESS, HotpatchPidEntry, KernelEvent, RateLimitEntry,
 };
 use log::{info, warn};
 use object::{Object, ObjectSymbol};
@@ -85,6 +85,9 @@ struct HotpatchTarget {
     symbol: String,
     #[serde(default)]
     pid: Option<u32>,
+    /// When true the kprobe guard will override the return value with EPERM (active defense).
+    #[serde(default)]
+    block_mode: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -303,16 +306,31 @@ fn attach_agents(bpf: &mut Ebpf) -> Result<()> {
     attach_tracepoint(bpf, "tp_sys_enter_bind", "syscalls", "sys_enter_bind")?;
     info!("network telemetry agent attached");
 
-    // Hot-patching Agent (kprobe guard)
-    let prog: &mut KProbe = bpf
-        .program_mut("kprobe_hotpatch_guard")
-        .context("missing kprobe_hotpatch_guard")?
-        .try_into()
-        .context("kprobe cast")?;
-    prog.load().context("load kprobe_hotpatch_guard")?;
-    prog.attach("tcp_connect", 0)
-        .context("attach kprobe tcp_connect")?;
-    info!("hot-patch kprobe guard attached on tcp_connect");
+    // Hot-patching Agent: kprobe guard (entry) on tcp_connect
+    {
+        let prog: &mut KProbe = bpf
+            .program_mut("kprobe_hotpatch_guard")
+            .context("missing kprobe_hotpatch_guard")?
+            .try_into()
+            .context("kprobe cast")?;
+        prog.load().context("load kprobe_hotpatch_guard")?;
+        prog.attach("tcp_connect", 0)
+            .context("attach kprobe tcp_connect")?;
+        info!("hot-patch kprobe guard attached on tcp_connect");
+    }
+
+    // Hot-patching Agent: kretprobe guard (exit) on tcp_connect
+    {
+        let prog: &mut KProbe = bpf
+            .program_mut("kretprobe_hotpatch_guard")
+            .context("missing kretprobe_hotpatch_guard")?
+            .try_into()
+            .context("kretprobe cast")?;
+        prog.load().context("load kretprobe_hotpatch_guard")?;
+        prog.attach("tcp_connect", 0)
+            .context("attach kretprobe tcp_connect")?;
+        info!("hot-patch kretprobe guard attached on tcp_connect");
+    }
 
     Ok(())
 }
@@ -468,7 +486,12 @@ fn sync_bpf_hotpatch_pids(shared: &Shared, targets: &[HotpatchTarget]) {
             if let Some(pid) = target.pid {
                 let entry = HotpatchPidEntry {
                     active: 1,
-                    _pad: [0; 3],
+                    mode: if target.block_mode {
+                        gaia_xdp_common::HOTPATCH_MODE_BLOCK
+                    } else {
+                        gaia_xdp_common::HOTPATCH_MODE_MONITOR
+                    },
+                    _pad: [0; 2],
                 };
                 let _ = pid_map.insert(pid, entry, 0);
             }
@@ -556,7 +579,7 @@ fn attach_hotpatch_targets(
             target.binary, target.symbol
         );
 
-        // Symbol resolver: resolve runtime address (informational)
+        // Symbol resolver: resolve runtime address (informational + ASLR bypass)
         if let Some(pid) = target.pid {
             match resolve_runtime_symbol(pid, binary_path, &target.symbol) {
                 Ok(addr) => info!(
@@ -576,6 +599,8 @@ fn attach_hotpatch_targets(
         }
     }
 
+    // Sync PID filter to BPF map
+    sync_bpf_hotpatch_pids(shared, targets);
     Ok(())
 }
 
@@ -714,15 +739,20 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
 
     // Privilege escalation alert
     if event.kind == EVENT_KIND_PRIVILEGE {
+        let level = if record.detail.contains("->ROOT") {
+            "critical"
+        } else {
+            "high"
+        };
         push_alert(
             &mut state,
-            "high",
-            "privilege change detected".into(),
+            level,
+            format!("privilege change detected: {}", record.detail),
             &record,
         );
     }
 
-    // Active defense: blocked port
+    // Active defense: blocked port (outbound connect)
     if event.kind == EVENT_KIND_NETWORK && event.action == EVENT_ACTION_BLOCKED {
         push_alert(
             &mut state,
@@ -738,6 +768,47 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
             &mut state,
             "high",
             format!("IP rate limit exceeded — {}", record.detail),
+            &record,
+        );
+    }
+
+    // Bind on suspicious port (process listening on blocked port)
+    if event.kind == EVENT_KIND_NETWORK && event.action == EVENT_ACTION_BIND
+        && record.detail.contains("bind:suspicious-port")
+    {
+        push_alert(
+            &mut state,
+            "critical",
+            format!(
+                "process {} (pid={}) binding on a blocked port — potential backdoor",
+                record.comm, record.pid
+            ),
+            &record,
+        );
+    }
+
+    // Hotpatch override: bpf_override_return was triggered
+    if event.kind == EVENT_KIND_HOTPATCH && event.action == EVENT_ACTION_OVERRIDE {
+        push_alert(
+            &mut state,
+            "critical",
+            format!(
+                "active defense: bpf_override_return executed for pid={} comm={}",
+                record.pid, record.comm
+            ),
+            &record,
+        );
+    }
+
+    // Hotpatch blocked uprobe (PID-filtered)
+    if event.kind == EVENT_KIND_HOTPATCH && event.action == EVENT_ACTION_BLOCKED {
+        push_alert(
+            &mut state,
+            "high",
+            format!(
+                "hotpatch uprobe blocked execution for pid={} comm={}",
+                record.pid, record.comm
+            ),
             &record,
         );
     }
@@ -825,6 +896,9 @@ fn action_name(action: u8) -> &'static str {
         3 => "alert",
         4 => "blocked",
         5 => "rate_limited",
+        6 => "bind",
+        7 => "kill",
+        8 => "override",
         _ => "unknown",
     }
 }
@@ -859,7 +933,7 @@ fn load_policy(path: &Path) -> Result<MonitorPolicy> {
     }
 }
 
-// ── Symbol resolver (ELF + /proc/[pid]/maps) ──
+// ── Symbol resolver (ELF .symtab/.dynsym + /proc/[pid]/maps for ASLR bypass) ──
 
 fn resolve_runtime_symbol(pid: u32, binary: &Path, symbol: &str) -> Result<u64> {
     let offset = resolve_symbol_offset(binary, symbol)?;
@@ -871,6 +945,7 @@ fn resolve_symbol_offset(binary: &Path, symbol: &str) -> Result<u64> {
     let data = fs::read(binary).with_context(|| format!("read binary {}", binary.display()))?;
     let obj = object::File::parse(data.as_slice()).context("parse ELF")?;
 
+    // Try static symbol table (.symtab) first
     for sym in obj.symbols() {
         if let Ok(name) = sym.name()
             && name == symbol
@@ -879,7 +954,7 @@ fn resolve_symbol_offset(binary: &Path, symbol: &str) -> Result<u64> {
             return Ok(sym.address());
         }
     }
-    // Also check dynamic symbols (.dynsym)
+    // Fall back to dynamic symbol table (.dynsym)
     for sym in obj.dynamic_symbols() {
         if let Ok(name) = sym.name()
             && name == symbol
@@ -891,6 +966,7 @@ fn resolve_symbol_offset(binary: &Path, symbol: &str) -> Result<u64> {
     Err(anyhow!("symbol {symbol} not found in {}", binary.display()))
 }
 
+/// Parse /proc/[pid]/maps to find the load base address of the binary, bypassing ASLR.
 fn resolve_process_mapping_base(pid: u32, binary: &Path) -> Result<u64> {
     let maps = fs::read_to_string(format!("/proc/{pid}/maps")).context("read /proc maps")?;
     let target = binary
