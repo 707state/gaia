@@ -12,11 +12,12 @@ use aya_ebpf::{
 };
 use gaia_xdp_common::{
     HotpatchPidEntry, KernelEvent, ProcessTreeEntry, RateLimitCounter, RateLimitEntry,
-    EVENT_ACTION_ALERT, EVENT_ACTION_BIND, EVENT_ACTION_BLOCKED, EVENT_ACTION_ENTER,
-    EVENT_ACTION_EXIT, EVENT_ACTION_KILL_REQUEST, EVENT_ACTION_RATE_LIMITED, EVENT_KIND_FILE_IO,
-    EVENT_KIND_HOTPATCH, EVENT_KIND_NETWORK, EVENT_KIND_PRIVILEGE, EVENT_KIND_PROCESS,
-    HOTPATCH_MODE_BLOCK, MAX_HOTPATCH_PIDS, MAX_PROCESS_TREE, MAX_RATE_LIMIT_COUNTERS,
-    MAX_RATE_LIMIT_RULES, PROTOCOL_TCP, RATE_ACTION_BLOCK,
+    ServicePidEntry, TrafficStats, EVENT_ACTION_ALERT, EVENT_ACTION_BIND, EVENT_ACTION_BLOCKED,
+    EVENT_ACTION_ENTER, EVENT_ACTION_EXIT, EVENT_ACTION_KILL_REQUEST, EVENT_ACTION_RATE_LIMITED,
+    EVENT_KIND_FILE_IO, EVENT_KIND_HOTPATCH, EVENT_KIND_NETWORK, EVENT_KIND_PRIVILEGE,
+    EVENT_KIND_PROCESS, HOTPATCH_MODE_BLOCK, MAX_HOTPATCH_PIDS, MAX_PROCESS_TREE,
+    MAX_RATE_LIMIT_COUNTERS, MAX_RATE_LIMIT_RULES, MAX_SERVICE_PIDS, MAX_TRAFFIC_STATS,
+    PROTOCOL_TCP, RATE_ACTION_BLOCK,
 };
 
 // ── Tracepoint field offsets (ARM64 / x86_64 compatible via common ABI) ──
@@ -104,6 +105,17 @@ static HOTPATCH_PIDS: HashMap<u32, HotpatchPidEntry> =
 #[map]
 static PROCESS_TREE: HashMap<u32, ProcessTreeEntry> =
     HashMap::with_max_entries(MAX_PROCESS_TREE, 0);
+
+/// Service PID filter: key = PID (u32), value = ServicePidEntry.
+/// User-space syncs monitored service PIDs into this map so traffic probes
+/// only count bytes for relevant processes.
+#[map]
+static SERVICE_PIDS: HashMap<u32, ServicePidEntry> = HashMap::with_max_entries(MAX_SERVICE_PIDS, 0);
+
+/// Per-PID traffic statistics: key = PID (u32), value = TrafficStats.
+/// Updated by kprobes on tcp_sendmsg / tcp_recvmsg.
+#[map]
+static TRAFFIC_STATS: HashMap<u32, TrafficStats> = HashMap::with_max_entries(MAX_TRAFFIC_STATS, 0);
 
 // ── Helper functions ──
 
@@ -614,6 +626,104 @@ pub fn uretprobe_hotpatch_exit(ctx: RetProbeContext) -> u32 {
 
     copy_bytes(&mut event.detail, b"uretprobe-exit");
     emit(event);
+    0
+}
+
+// ── Traffic Monitoring Agent ──
+//
+// Hooks: kprobe on tcp_sendmsg, tcp_recvmsg, tcp_cleanup_rbuf
+// Role: Count bytes sent/received per PID for monitored service processes.
+// Only PIDs present in the SERVICE_PIDS map are tracked.
+
+/// kprobe on tcp_sendmsg — counts outbound bytes for monitored service PIDs.
+///
+/// Prototype: int tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
+/// The `size` argument (3rd parameter) gives us the byte count.
+#[kprobe]
+pub fn kprobe_tcp_sendmsg(ctx: ProbeContext) -> u32 {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let tgid = (pid_tgid >> 32) as u32;
+
+    // Only track PIDs belonging to monitored services
+    if unsafe { SERVICE_PIDS.get(&tgid) }.is_none() {
+        return 0;
+    }
+
+    // 3rd argument = size (bytes to send)
+    let size: u64 = match ctx.arg::<u64>(2) {
+        Some(s) => s,
+        None => return 0,
+    };
+
+    if let Some(stats) = unsafe { TRAFFIC_STATS.get(&tgid) } {
+        let updated = TrafficStats {
+            bytes_sent: stats.bytes_sent + size,
+            bytes_recv: stats.bytes_recv,
+            packets_sent: stats.packets_sent + 1,
+            packets_recv: stats.packets_recv,
+        };
+        let _ = TRAFFIC_STATS.insert(&tgid, &updated, 0);
+    } else {
+        let new_stats = TrafficStats {
+            bytes_sent: size,
+            bytes_recv: 0,
+            packets_sent: 1,
+            packets_recv: 0,
+        };
+        let _ = TRAFFIC_STATS.insert(&tgid, &new_stats, 0);
+    }
+    0
+}
+
+/// kprobe on tcp_recvmsg — counts inbound bytes for monitored service PIDs.
+///
+/// Prototype: int tcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, ...)
+/// The `len` argument (3rd parameter) gives us the requested byte count.
+/// We use kretprobe to get the actual bytes received from the return value.
+#[kprobe]
+pub fn kprobe_tcp_recvmsg(_ctx: ProbeContext) -> u32 {
+    // We use the kretprobe to capture actual received bytes from the return value.
+    // This kprobe is a no-op placeholder to ensure the program is loaded.
+    0
+}
+
+/// kretprobe on tcp_recvmsg — captures actual bytes received from return value.
+///
+/// Return value > 0 = number of bytes actually received.
+/// Return value <= 0 = error or no data.
+#[kretprobe]
+pub fn kretprobe_tcp_recvmsg(ctx: RetProbeContext) -> u32 {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let tgid = (pid_tgid >> 32) as u32;
+
+    // Only track PIDs belonging to monitored services
+    if unsafe { SERVICE_PIDS.get(&tgid) }.is_none() {
+        return 0;
+    }
+
+    let ret: i64 = ctx.ret();
+    if ret <= 0 {
+        return 0;
+    }
+    let bytes = ret as u64;
+
+    if let Some(stats) = unsafe { TRAFFIC_STATS.get(&tgid) } {
+        let updated = TrafficStats {
+            bytes_sent: stats.bytes_sent,
+            bytes_recv: stats.bytes_recv + bytes,
+            packets_sent: stats.packets_sent,
+            packets_recv: stats.packets_recv + 1,
+        };
+        let _ = TRAFFIC_STATS.insert(&tgid, &updated, 0);
+    } else {
+        let new_stats = TrafficStats {
+            bytes_sent: 0,
+            bytes_recv: bytes,
+            packets_sent: 0,
+            packets_recv: 1,
+        };
+        let _ = TRAFFIC_STATS.insert(&tgid, &new_stats, 0);
+    }
     0
 }
 

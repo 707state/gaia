@@ -25,6 +25,7 @@ use gaia_xdp_common::{
     EVENT_ACTION_ALERT, EVENT_ACTION_BIND, EVENT_ACTION_BLOCKED, EVENT_ACTION_KILL_REQUEST,
     EVENT_ACTION_RATE_LIMITED, EVENT_KIND_FILE_IO, EVENT_KIND_HOTPATCH, EVENT_KIND_NETWORK,
     EVENT_KIND_PRIVILEGE, EVENT_KIND_PROCESS, HotpatchPidEntry, KernelEvent, RateLimitEntry,
+    ServicePidEntry, TrafficStats,
 };
 use libc;
 use log::{info, warn};
@@ -40,8 +41,9 @@ use tokio::{
 use tower_http::cors::CorsLayer;
 
 const DEFAULT_CONFIG: &str = "gaia.toml";
-const MAX_EVENT_HISTORY: usize = 512;
-const MAX_ALERT_HISTORY: usize = 256;
+/// No hard cap — store all events in memory. The frontend handles pagination.
+const MAX_EVENT_HISTORY: usize = 100_000;
+const MAX_ALERT_HISTORY: usize = 50_000;
 const BASELINE_WINDOW_SECS: u64 = 30;
 
 // ── CLI ──
@@ -166,6 +168,7 @@ struct Snapshot {
     services: HashMap<String, Vec<u32>>,
     events: Vec<EventRecord>,
     alerts: Vec<AlertRecord>,
+    total_events: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -176,9 +179,36 @@ struct FeatureStatus {
     hotpatch_agent: bool,
     anomaly_engine: bool,
     symbol_resolver: bool,
+    traffic_agent: bool,
 }
 
-// ── Runtime state ──
+#[derive(Debug, Clone, Serialize, Default)]
+struct ServiceTrafficSnapshot {
+    service: String,
+    pids: Vec<u32>,
+    bytes_sent: u64,
+    bytes_recv: u64,
+    packets_sent: u64,
+    packets_recv: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TrafficDataPoint {
+    timestamp_ms: u64,
+    service: String,
+    bytes_sent: u64,
+    bytes_recv: u64,
+    packets_sent: u64,
+    packets_recv: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TrafficResponse {
+    services: Vec<ServiceTrafficSnapshot>,
+    history: Vec<TrafficDataPoint>,
+}
+
+// -- Runtime state --
 
 #[derive(Debug)]
 struct BaselineState {
@@ -193,6 +223,10 @@ struct RuntimeState {
     events: VecDeque<EventRecord>,
     alerts: VecDeque<AlertRecord>,
     baseline: BaselineState,
+    /// Per-service previous traffic totals (for computing deltas)
+    traffic_prev: HashMap<String, ServiceTrafficSnapshot>,
+    /// Time-series traffic history
+    traffic_history: VecDeque<TrafficDataPoint>,
 }
 
 impl RuntimeState {
@@ -206,6 +240,8 @@ impl RuntimeState {
                 window_started: Instant::now(),
                 counters: HashMap::new(),
             },
+            traffic_prev: HashMap::new(),
+            traffic_history: VecDeque::new(),
         }
     }
 }
@@ -218,6 +254,7 @@ struct Shared {
     bpf: Arc<Mutex<Ebpf>>,
     hotpatch_active: Arc<Mutex<bool>>,
     symbol_resolver_ok: Arc<Mutex<bool>>,
+    traffic_agent_ok: Arc<Mutex<bool>>,
 }
 
 // ── main ──
@@ -247,6 +284,7 @@ async fn main() -> Result<()> {
         bpf: Arc::new(Mutex::new(bpf)),
         hotpatch_active: Arc::new(Mutex::new(false)),
         symbol_resolver_ok: Arc::new(Mutex::new(true)),
+        traffic_agent_ok: Arc::new(Mutex::new(false)),
     };
 
     // Hotpatch targets are best-effort: failure to attach should not crash.
@@ -273,6 +311,7 @@ async fn main() -> Result<()> {
     }
 
     spawn_service_tracker(shared.clone());
+    spawn_traffic_collector(shared.clone());
 
     let web_state = shared.clone();
     let web_listen = opt.web_listen.clone();
@@ -331,6 +370,45 @@ fn attach_agents(bpf: &mut Ebpf) -> Result<()> {
         prog.attach("tcp_connect", 0)
             .context("attach kretprobe tcp_connect")?;
         info!("hot-patch kretprobe guard attached on tcp_connect");
+    }
+
+    // Traffic Monitoring Agent: kprobe on tcp_sendmsg
+    {
+        let prog: &mut KProbe = bpf
+            .program_mut("kprobe_tcp_sendmsg")
+            .context("missing kprobe_tcp_sendmsg")?
+            .try_into()
+            .context("kprobe cast tcp_sendmsg")?;
+        prog.load().context("load kprobe_tcp_sendmsg")?;
+        prog.attach("tcp_sendmsg", 0)
+            .context("attach kprobe tcp_sendmsg")?;
+        info!("traffic agent: kprobe attached on tcp_sendmsg");
+    }
+
+    // Traffic Monitoring Agent: kprobe on tcp_recvmsg (placeholder)
+    {
+        let prog: &mut KProbe = bpf
+            .program_mut("kprobe_tcp_recvmsg")
+            .context("missing kprobe_tcp_recvmsg")?
+            .try_into()
+            .context("kprobe cast tcp_recvmsg")?;
+        prog.load().context("load kprobe_tcp_recvmsg")?;
+        prog.attach("tcp_recvmsg", 0)
+            .context("attach kprobe tcp_recvmsg")?;
+        info!("traffic agent: kprobe attached on tcp_recvmsg");
+    }
+
+    // Traffic Monitoring Agent: kretprobe on tcp_recvmsg (captures actual bytes)
+    {
+        let prog: &mut KProbe = bpf
+            .program_mut("kretprobe_tcp_recvmsg")
+            .context("missing kretprobe_tcp_recvmsg")?
+            .try_into()
+            .context("kretprobe cast tcp_recvmsg")?;
+        prog.load().context("load kretprobe_tcp_recvmsg")?;
+        prog.attach("tcp_recvmsg", 0)
+            .context("attach kretprobe tcp_recvmsg")?;
+        info!("traffic agent: kretprobe attached on tcp_recvmsg");
     }
 
     Ok(())
@@ -644,6 +722,10 @@ fn spawn_event_collector(events: RingBuf<MapData>, shared: Shared) {
 
 fn spawn_service_tracker(shared: Shared) {
     tokio::spawn(async move {
+        // Mark traffic agent as active
+        if let Ok(mut t) = shared.traffic_agent_ok.lock() {
+            *t = true;
+        }
         loop {
             let services = shared.policy.read().await.monitored_services.clone();
             if services.is_empty() {
@@ -656,6 +738,10 @@ fn spawn_service_tracker(shared: Shared) {
                     mapping.insert(service.clone(), vec![pid]);
                 }
             }
+
+            // Sync service PIDs to BPF map for traffic filtering
+            sync_bpf_service_pids(&shared, &mapping);
+
             let mut state = shared.runtime.write().await;
             state.service_map = mapping;
             drop(state);
@@ -684,7 +770,130 @@ async fn query_service_pid(service: &str) -> Option<u32> {
     (pid > 0).then_some(pid)
 }
 
-// ── Anomaly detection engine ──
+/// Sync monitored service PIDs into the SERVICE_PIDS BPF map so that
+/// traffic kprobes only count bytes for relevant processes.
+fn sync_bpf_service_pids(shared: &Shared, mapping: &HashMap<String, Vec<u32>>) {
+    if let Ok(mut bpf) = shared.bpf.lock() {
+        let map = match bpf.map_mut("SERVICE_PIDS") {
+            Some(m) => m,
+            None => {
+                warn!("missing SERVICE_PIDS map");
+                return;
+            }
+        };
+        let mut pid_map = match BpfHashMap::<_, u32, ServicePidEntry>::try_from(map) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("SERVICE_PIDS map cast failed: {e:#}");
+                return;
+            }
+        };
+        // Clear existing entries
+        let existing: Vec<u32> = pid_map.keys().filter_map(|k| k.ok()).collect();
+        for k in existing {
+            let _ = pid_map.remove(&k);
+        }
+        // Insert current service PIDs
+        for (idx, (_svc, pids)) in mapping.iter().enumerate() {
+            for &pid in pids {
+                let entry = ServicePidEntry {
+                    active: 1,
+                    _pad: [0; 3],
+                    service_idx: idx as u32,
+                };
+                let _ = pid_map.insert(pid, entry, 0);
+            }
+        }
+    }
+}
+
+/// Read per-PID traffic stats from the BPF map and aggregate by service.
+fn read_bpf_traffic_stats(
+    shared: &Shared,
+    service_map: &HashMap<String, Vec<u32>>,
+) -> Vec<ServiceTrafficSnapshot> {
+    let mut results = Vec::new();
+    let Ok(mut bpf) = shared.bpf.lock() else {
+        return results;
+    };
+    let Some(map) = bpf.map_mut("TRAFFIC_STATS") else {
+        return results;
+    };
+    let Ok(stats_map) = BpfHashMap::<_, u32, TrafficStats>::try_from(map) else {
+        return results;
+    };
+
+    for (svc, pids) in service_map {
+        let mut snap = ServiceTrafficSnapshot {
+            service: svc.clone(),
+            pids: pids.clone(),
+            ..Default::default()
+        };
+        for &pid in pids {
+            if let Ok(stats) = stats_map.get(&pid, 0) {
+                snap.bytes_sent += stats.bytes_sent;
+                snap.bytes_recv += stats.bytes_recv;
+                snap.packets_sent += stats.packets_sent;
+                snap.packets_recv += stats.packets_recv;
+            }
+        }
+        results.push(snap);
+    }
+    results
+}
+
+/// Spawn a periodic task that samples traffic stats every 2 seconds,
+/// computes deltas, and stores time-series history.
+fn spawn_traffic_collector(shared: Shared) {
+    const MAX_TRAFFIC_HISTORY: usize = 900; // ~30 min at 2s intervals
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let service_map = shared.runtime.read().await.service_map.clone();
+            if service_map.is_empty() {
+                continue;
+            }
+            let current = read_bpf_traffic_stats(&shared, &service_map);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            let mut state = shared.runtime.write().await;
+            for snap in &current {
+                let prev = state.traffic_prev.get(&snap.service);
+                let delta_sent = snap.bytes_sent.saturating_sub(
+                    prev.map(|p| p.bytes_sent).unwrap_or(0),
+                );
+                let delta_recv = snap.bytes_recv.saturating_sub(
+                    prev.map(|p| p.bytes_recv).unwrap_or(0),
+                );
+                let delta_ps = snap.packets_sent.saturating_sub(
+                    prev.map(|p| p.packets_sent).unwrap_or(0),
+                );
+                let delta_pr = snap.packets_recv.saturating_sub(
+                    prev.map(|p| p.packets_recv).unwrap_or(0),
+                );
+                state.traffic_history.push_back(TrafficDataPoint {
+                    timestamp_ms: now_ms,
+                    service: snap.service.clone(),
+                    bytes_sent: delta_sent,
+                    bytes_recv: delta_recv,
+                    packets_sent: delta_ps,
+                    packets_recv: delta_pr,
+                });
+                state
+                    .traffic_prev
+                    .insert(snap.service.clone(), snap.clone());
+            }
+            while state.traffic_history.len() > MAX_TRAFFIC_HISTORY {
+                state.traffic_history.pop_front();
+            }
+        }
+    });
+}
+
+// -- Anomaly detection engine --
 
 async fn process_event(event: KernelEvent, shared: &Shared) {
     let record = to_event_record(event);
@@ -1037,6 +1246,7 @@ async fn run_http_server(shared: Shared, addr: String) -> Result<()> {
 
     let app = Router::new()
         .route("/api/v1/state", get(api_state))
+        .route("/api/v1/traffic", get(api_traffic))
         .route("/api/v1/config", get(api_get_config).post(api_update_config))
         .route(
             "/api/v1/config/rate-limit",
@@ -1077,7 +1287,13 @@ async fn api_state(State(shared): State<Shared>) -> Json<Snapshot> {
         .lock()
         .map(|v| *v)
         .unwrap_or(false);
+    let traffic_agent = shared
+        .traffic_agent_ok
+        .lock()
+        .map(|v| *v)
+        .unwrap_or(false);
 
+    let total_events = state.events.len();
     let snapshot = Snapshot {
         features: FeatureStatus {
             file_io_agent: true,
@@ -1086,16 +1302,33 @@ async fn api_state(State(shared): State<Shared>) -> Json<Snapshot> {
             hotpatch_agent: hotpatch_active,
             anomaly_engine: true,
             symbol_resolver,
+            traffic_agent,
         },
         counters: state.counters.clone(),
         services: state.service_map.clone(),
         events: state.events.iter().cloned().collect(),
         alerts: state.alerts.iter().cloned().collect(),
+        total_events,
     };
     Json(snapshot)
 }
 
-// ── Config API: full policy ──
+// -- Traffic API --
+
+async fn api_traffic(State(shared): State<Shared>) -> Json<TrafficResponse> {
+    let state = shared.runtime.read().await;
+    let service_map = state.service_map.clone();
+    drop(state);
+
+    let services = read_bpf_traffic_stats(&shared, &service_map);
+
+    let state = shared.runtime.read().await;
+    let history: Vec<TrafficDataPoint> = state.traffic_history.iter().cloned().collect();
+
+    Json(TrafficResponse { services, history })
+}
+
+// -- Config API: full policy --
 
 async fn api_get_config(State(shared): State<Shared>) -> Json<MonitorPolicy> {
     let policy = shared.policy.read().await;

@@ -51,6 +51,13 @@ pub const MAX_HOTPATCH_PIDS: u32 = 256;
 /// Maximum entries in the process parent map (PID → PPID)
 pub const MAX_PROCESS_TREE: u32 = 4096;
 
+// ── Traffic monitoring ──
+
+/// Maximum tracked service PIDs (synced from user-space)
+pub const MAX_SERVICE_PIDS: u32 = 1024;
+/// Maximum per-PID traffic stats entries
+pub const MAX_TRAFFIC_STATS: u32 = 1024;
+
 // ── Hotpatch guard modes ──
 
 /// kprobe guard: only log / alert, do not override return
@@ -114,6 +121,35 @@ pub struct ProcessTreeEntry {
     pub comm: [u8; COMM_LEN],
 }
 
+/// Service PID marker — stored in SERVICE_PIDS BPF map.
+/// Key: PID (u32). Value: this struct.
+/// User-space syncs monitored service PIDs into this map so that
+/// eBPF traffic probes can filter only relevant processes.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ServicePidEntry {
+    /// 1 = active, 0 = inactive
+    pub active: u8,
+    pub _pad: [u8; 3],
+    /// Service index (maps back to user-space service list for aggregation)
+    pub service_idx: u32,
+}
+
+/// Per-PID traffic statistics accumulated by eBPF kprobes on tcp_sendmsg / tcp_recvmsg.
+/// Key: PID (u32). Value: this struct.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TrafficStats {
+    /// Total bytes sent (outbound)
+    pub bytes_sent: u64,
+    /// Total bytes received (inbound)
+    pub bytes_recv: u64,
+    /// Total packets/calls sent
+    pub packets_sent: u64,
+    /// Total packets/calls received
+    pub packets_recv: u64,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct KernelEvent {
@@ -162,4 +198,6 @@ mod pod_impls {
     unsafe impl aya::Pod for HotpatchPidEntry {}
     unsafe impl aya::Pod for KernelEvent {}
     unsafe impl aya::Pod for ProcessTreeEntry {}
+    unsafe impl aya::Pod for ServicePidEntry {}
+    unsafe impl aya::Pod for TrafficStats {}
 }
