@@ -1382,15 +1382,28 @@ async fn api_traffic(State(shared): State<Shared>) -> Json<TrafficResponse> {
     let state = shared.runtime.read().await;
     let service_map = state.service_map.clone();
     let history: Vec<TrafficDataPoint> = state.traffic_history.iter().cloned().collect();
+
+    // Compute cumulative totals from history deltas (traffic since daemon start)
+    let mut sys_sent: u64 = 0;
+    let mut sys_recv: u64 = 0;
+    let mut sys_ps: u64 = 0;
+    let mut sys_pr: u64 = 0;
+    for h in &history {
+        sys_sent += h.bytes_sent;
+        sys_recv += h.bytes_recv;
+        sys_ps += h.packets_sent;
+        sys_pr += h.packets_recv;
+    }
     drop(state);
 
-    let (sys_total, services) = read_all_traffic_stats(&shared, &service_map);
+    // Per-service breakdown from BPF map
+    let (_raw_total, services) = read_all_traffic_stats(&shared, &service_map);
 
     Json(TrafficResponse {
-        system_bytes_sent: sys_total.0,
-        system_bytes_recv: sys_total.1,
-        system_packets_sent: sys_total.2,
-        system_packets_recv: sys_total.3,
+        system_bytes_sent: sys_sent,
+        system_bytes_recv: sys_recv,
+        system_packets_sent: sys_ps,
+        system_packets_recv: sys_pr,
         services,
         history,
     })

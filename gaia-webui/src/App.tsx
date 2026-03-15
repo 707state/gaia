@@ -11,7 +11,7 @@ import {
   SwapOutlined,
 } from '@ant-design/icons'
 import type { Lang, Snapshot } from './types'
-import { initialLang, mockSnapshot } from './helpers'
+import { initialLang, emptySnapshot } from './helpers'
 import DashboardView from './components/DashboardView'
 import EventsView from './components/EventsView'
 import ConfigView from './components/ConfigView'
@@ -25,7 +25,7 @@ type Tab = 'dashboard' | 'events' | 'traffic' | 'config'
 function App() {
   const [tab, setTab] = useState<Tab>('dashboard')
   const [lang, setLang] = useState<Lang>(initialLang)
-  const [snapshot, setSnapshot] = useState<Snapshot>(mockSnapshot)
+  const [snapshot, setSnapshot] = useState<Snapshot>(emptySnapshot)
   const [live, setLive] = useState(false)
   const [collapsed, setCollapsed] = useState(false)
   const [darkMode, setDarkMode] = useState(true)
