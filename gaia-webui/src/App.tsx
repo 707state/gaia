@@ -48,6 +48,16 @@ type Snapshot = {
   traffic: TrafficSnapshot
 }
 
+type ToggleItem = {
+  value: string
+  enabled: boolean
+}
+
+type TogglePort = {
+  port: number
+  enabled: boolean
+}
+
 type RateLimitRule = {
   cidr: string
   max_conn_per_sec: number
@@ -59,13 +69,14 @@ type HotpatchTarget = {
   binary: string
   symbol: string
   pid?: number | null
+  enabled: boolean
 }
 
 type MonitorPolicy = {
-  sensitive_prefixes: string[]
-  monitored_services: string[]
-  exec_whitelist_prefixes: string[]
-  blocked_ports: number[]
+  sensitive_prefixes: ToggleItem[]
+  monitored_services: ToggleItem[]
+  exec_whitelist_prefixes: ToggleItem[]
+  blocked_ports: TogglePort[]
   baseline_thresholds: Record<string, number>
   hotpatch: { targets: HotpatchTarget[] }
   rate_limit_rules: RateLimitRule[]
@@ -1022,6 +1033,21 @@ function ConfigTab({ lang, tr }: { lang: Lang; tr: (zh: string, en: string) => s
     setTimeout(() => setMsg(''), 3000)
   }
 
+  const toggle = async (section: string, index: number, enabled: boolean) => {
+    try {
+      const r = await fetch('/api/v1/config/toggle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ section, index, enabled }),
+      })
+      if (r.ok) {
+        const updated = await r.json() as MonitorPolicy
+        setPolicy(updated)
+        flash(enabled ? tr('已启用', 'Enabled') : tr('已禁用', 'Disabled'))
+      }
+    } catch { flash(tr('切换失败', 'Toggle failed')) }
+  }
+
   if (loading) return <div className="tab-content"><div className="empty-state">{tr('加载配置中...', 'Loading configuration...')}</div></div>
   if (!policy) return <div className="tab-content"><div className="empty-state">{tr('无法加载配置（后端离线？）', 'Unable to load configuration (backend offline?)')}</div></div>
 
@@ -1031,14 +1057,93 @@ function ConfigTab({ lang, tr }: { lang: Lang; tr: (zh: string, en: string) => s
 
       <div className="tab-intro">
         <p>{tr(
-          '在此配置监控策略，包括敏感文件路径、可执行白名单、监控服务、阻断端口、基线阈值、IP 限流规则和热补丁目标。所有配置变更将实时同步到内核态 eBPF 探针。',
-          'Configure monitoring policies here, including sensitive file paths, executable whitelists, monitored services, blocked ports, baseline thresholds, IP rate limiting rules, and hotpatch targets. All changes are synced to kernel-space eBPF probes in real-time.'
+          '在此配置监控策略。所有配置项均支持启用/禁用开关，禁用的配置项将不会参与内核态 eBPF 探针的规则匹配，但会保留在配置文件中以便随时重新启用。',
+          'Configure monitoring policies here. All items support enable/disable toggles. Disabled items are excluded from kernel-space eBPF rule matching but remain in the config file for easy re-enabling.'
         )}</p>
       </div>
 
-      <GeneralPolicyPanel policy={policy} setPolicy={setPolicy} saving={saving} setSaving={setSaving} flash={flash} lang={lang} tr={tr} />
-      <RateLimitPanel rules={policy.rate_limit_rules} setRules={r => setPolicy({ ...policy, rate_limit_rules: r })} flash={flash} tr={tr} />
-      <HotpatchConfigPanel targets={policy.hotpatch.targets} setTargets={t => setPolicy({ ...policy, hotpatch: { targets: t } })} flash={flash} tr={tr} />
+      <ToggleListPanel
+        title={tr('敏感文件前缀', 'Sensitive File Prefixes')}
+        desc={tr('匹配的文件访问将触发告警。禁用后该前缀不再参与匹配。', 'Matching file access triggers alerts. Disabled prefixes are excluded from matching.')}
+        items={policy.sensitive_prefixes}
+        section="sensitive_prefixes"
+        toggle={toggle}
+        renderValue={item => item.value}
+        addPlaceholder="/etc/shadow"
+        onAdd={async (value) => {
+          const body = { sensitive_prefixes: [...policy.sensitive_prefixes, { value, enabled: true }] }
+          try {
+            const r = await fetch('/api/v1/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+            if (r.ok) { setPolicy(await r.json()); flash(tr('已添加', 'Added')) }
+          } catch { flash(tr('添加失败', 'Add failed')) }
+        }}
+        onDelete={async (index) => {
+          const items = policy.sensitive_prefixes.filter((_, i) => i !== index)
+          const body = { sensitive_prefixes: items }
+          try {
+            const r = await fetch('/api/v1/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+            if (r.ok) { setPolicy(await r.json()); flash(tr('已删除', 'Deleted')) }
+          } catch { flash(tr('删除失败', 'Delete failed')) }
+        }}
+        tr={tr}
+      />
+
+      <ToggleListPanel
+        title={tr('可执行白名单前缀', 'Exec Whitelist Prefixes')}
+        desc={tr('允许的 execve 路径前缀，不在白名单内的将触发告警。', 'Allowed execve path prefixes; non-whitelisted paths trigger alerts.')}
+        items={policy.exec_whitelist_prefixes}
+        section="exec_whitelist_prefixes"
+        toggle={toggle}
+        renderValue={item => item.value}
+        addPlaceholder="/usr/bin"
+        onAdd={async (value) => {
+          const body = { exec_whitelist_prefixes: [...policy.exec_whitelist_prefixes, { value, enabled: true }] }
+          try {
+            const r = await fetch('/api/v1/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+            if (r.ok) { setPolicy(await r.json()); flash(tr('已添加', 'Added')) }
+          } catch { flash(tr('添加失败', 'Add failed')) }
+        }}
+        onDelete={async (index) => {
+          const items = policy.exec_whitelist_prefixes.filter((_, i) => i !== index)
+          const body = { exec_whitelist_prefixes: items }
+          try {
+            const r = await fetch('/api/v1/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+            if (r.ok) { setPolicy(await r.json()); flash(tr('已删除', 'Deleted')) }
+          } catch { flash(tr('删除失败', 'Delete failed')) }
+        }}
+        tr={tr}
+      />
+
+      <ToggleListPanel
+        title={tr('监控服务', 'Monitored Services')}
+        desc={tr('systemd unit 名称，自动追踪其 PID。禁用后不再追踪。', 'Systemd unit names; PIDs are tracked automatically. Disabled services are not tracked.')}
+        items={policy.monitored_services}
+        section="monitored_services"
+        toggle={toggle}
+        renderValue={item => item.value}
+        addPlaceholder="sshd.service"
+        onAdd={async (value) => {
+          const body = { monitored_services: [...policy.monitored_services, { value, enabled: true }] }
+          try {
+            const r = await fetch('/api/v1/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+            if (r.ok) { setPolicy(await r.json()); flash(tr('已添加', 'Added')) }
+          } catch { flash(tr('添加失败', 'Add failed')) }
+        }}
+        onDelete={async (index) => {
+          const items = policy.monitored_services.filter((_, i) => i !== index)
+          const body = { monitored_services: items }
+          try {
+            const r = await fetch('/api/v1/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+            if (r.ok) { setPolicy(await r.json()); flash(tr('已删除', 'Deleted')) }
+          } catch { flash(tr('删除失败', 'Delete failed')) }
+        }}
+        tr={tr}
+      />
+
+      <BlockedPortsPanel policy={policy} setPolicy={setPolicy} toggle={toggle} flash={flash} tr={tr} />
+      <BaselinePanel policy={policy} setPolicy={setPolicy} saving={saving} setSaving={setSaving} flash={flash} lang={lang} tr={tr} />
+      <RateLimitPanel rules={policy.rate_limit_rules} setRules={r => setPolicy({ ...policy, rate_limit_rules: r })} toggle={toggle} flash={flash} tr={tr} />
+      <HotpatchConfigPanel targets={policy.hotpatch.targets} setTargets={t => setPolicy({ ...policy, hotpatch: { targets: t } })} toggle={toggle} flash={flash} tr={tr} />
     </div>
   )
 }
@@ -1105,60 +1210,142 @@ function AlertList({ alerts, lang }: { alerts: AlertRecord[]; lang: Lang }) {
 
 // ── Config sub-panels ──
 
-function GeneralPolicyPanel({ policy, setPolicy, saving, setSaving, flash, lang, tr }: {
+// Generic toggle list panel for ToggleItem arrays
+function ToggleListPanel({ title, desc, items, section, toggle, renderValue, addPlaceholder, onAdd, onDelete, tr }: {
+  title: string; desc: string; items: ToggleItem[]; section: string
+  toggle: (section: string, index: number, enabled: boolean) => void
+  renderValue: (item: ToggleItem) => string
+  addPlaceholder: string
+  onAdd: (value: string) => void
+  onDelete: (index: number) => void
+  tr: (zh: string, en: string) => string
+}) {
+  const [draft, setDraft] = useState('')
+  const enabled = items.filter(i => i.enabled).length
+
+  return (
+    <div className="card">
+      <div className="card-header">
+        <h3>{title}</h3>
+        <span className="card-badge">{enabled}/{items.length} {tr('启用', 'enabled')}</span>
+      </div>
+      <p className="card-desc">{desc}</p>
+
+      {items.length > 0 && (
+        <div className="toggle-list">
+          {items.map((item, i) => (
+            <div key={i} className={`toggle-row ${item.enabled ? '' : 'disabled'}`}>
+              <button
+                className={`switch ${item.enabled ? 'on' : 'off'}`}
+                onClick={() => toggle(section, i, !item.enabled)}
+                title={item.enabled ? tr('点击禁用', 'Click to disable') : tr('点击启用', 'Click to enable')}
+              >
+                <span className="switch-knob" />
+              </button>
+              <code className="toggle-value">{renderValue(item)}</code>
+              <button className="btn-danger-sm" onClick={() => onDelete(i)}>{tr('删除', 'Delete')}</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {items.length === 0 && <div className="empty-state">{tr('暂无配置项', 'No items configured')}</div>}
+
+      <div className="add-form">
+        <div className="add-row">
+          <input type="text" placeholder={addPlaceholder} value={draft} onChange={e => setDraft(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && draft.trim()) { onAdd(draft.trim()); setDraft('') } }} />
+          <button className="btn-primary" onClick={() => { if (draft.trim()) { onAdd(draft.trim()); setDraft('') } }}>{tr('添加', 'Add')}</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// Blocked ports panel
+function BlockedPortsPanel({ policy, setPolicy, toggle, flash, tr }: {
+  policy: MonitorPolicy; setPolicy: (p: MonitorPolicy) => void
+  toggle: (section: string, index: number, enabled: boolean) => void
+  flash: (msg: string) => void; tr: (zh: string, en: string) => string
+}) {
+  const [draft, setDraft] = useState('')
+  const ports = policy.blocked_ports
+  const enabled = ports.filter(p => p.enabled).length
+
+  const handleAdd = async () => {
+    const port = parseInt(draft.trim(), 10)
+    if (isNaN(port) || port < 1 || port > 65535) { flash(tr('请输入有效端口号 (1-65535)', 'Enter a valid port (1-65535)')); return }
+    const body = { blocked_ports: [...ports, { port, enabled: true }] }
+    try {
+      const r = await fetch('/api/v1/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      if (r.ok) { setPolicy(await r.json()); setDraft(''); flash(tr('已添加', 'Added')) }
+    } catch { flash(tr('添加失败', 'Add failed')) }
+  }
+
+  const handleDelete = async (index: number) => {
+    const items = ports.filter((_, i) => i !== index)
+    const body = { blocked_ports: items }
+    try {
+      const r = await fetch('/api/v1/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      if (r.ok) { setPolicy(await r.json()); flash(tr('已删除', 'Deleted')) }
+    } catch { flash(tr('删除失败', 'Delete failed')) }
+  }
+
+  return (
+    <div className="card">
+      <div className="card-header">
+        <h3>{tr('阻断端口', 'Blocked Ports')}</h3>
+        <span className="card-badge">{enabled}/{ports.length} {tr('启用', 'enabled')}</span>
+      </div>
+      <p className="card-desc">{tr('匹配的连接将被阻断。禁用后该端口不再参与阻断规则。', 'Matching connections are blocked. Disabled ports are excluded from blocking rules.')}</p>
+
+      {ports.length > 0 && (
+        <div className="toggle-list">
+          {ports.map((item, i) => (
+            <div key={i} className={`toggle-row ${item.enabled ? '' : 'disabled'}`}>
+              <button
+                className={`switch ${item.enabled ? 'on' : 'off'}`}
+                onClick={() => toggle('blocked_ports', i, !item.enabled)}
+              >
+                <span className="switch-knob" />
+              </button>
+              <code className="toggle-value">{item.port}</code>
+              <button className="btn-danger-sm" onClick={() => handleDelete(i)}>{tr('删除', 'Delete')}</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="add-form">
+        <div className="add-row">
+          <input type="number" min={1} max={65535} placeholder="4444" value={draft} onChange={e => setDraft(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') handleAdd() }} />
+          <button className="btn-primary" onClick={handleAdd}>{tr('添加', 'Add')}</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// Baseline thresholds panel
+function BaselinePanel({ policy, setPolicy, saving, setSaving, flash, lang, tr }: {
   policy: MonitorPolicy; setPolicy: (p: MonitorPolicy) => void; saving: boolean; setSaving: (v: boolean) => void
   flash: (msg: string) => void; lang: Lang; tr: (zh: string, en: string) => string
 }) {
-  const [sensitivePrefixes, setSensitivePrefixes] = useState(policy.sensitive_prefixes.join('\n'))
-  const [execWhitelist, setExecWhitelist] = useState(policy.exec_whitelist_prefixes.join('\n'))
-  const [monitoredServices, setMonitoredServices] = useState(policy.monitored_services.join('\n'))
-  const [blockedPorts, setBlockedPorts] = useState(policy.blocked_ports.join(', '))
   const [thresholds, setThresholds] = useState({ ...policy.baseline_thresholds })
 
   const handleSave = async () => {
     setSaving(true)
-    const body = {
-      sensitive_prefixes: sensitivePrefixes.split('\n').map(s => s.trim()).filter(Boolean),
-      exec_whitelist_prefixes: execWhitelist.split('\n').map(s => s.trim()).filter(Boolean),
-      monitored_services: monitoredServices.split('\n').map(s => s.trim()).filter(Boolean),
-      blocked_ports: blockedPorts.split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n)),
-      baseline_thresholds: thresholds,
-    }
     try {
-      const r = await fetch('/api/v1/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-      if (r.ok) { const updated = await r.json() as MonitorPolicy; setPolicy(updated); flash(tr('通用策略已保存', 'General policy saved')) }
-      else flash(tr('保存失败: ', 'Save failed: ') + r.statusText)
-    } catch { flash(tr('保存失败: 网络错误', 'Save failed: network error')) }
+      const r = await fetch('/api/v1/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ baseline_thresholds: thresholds }) })
+      if (r.ok) { setPolicy(await r.json()); flash(tr('基线阈值已保存', 'Baseline thresholds saved')) }
+      else flash(tr('保存失败', 'Save failed'))
+    } catch { flash(tr('保存失败', 'Save failed')) }
     setSaving(false)
   }
 
   return (
     <div className="card">
-      <div className="card-header"><h3>{tr('通用监控策略', 'General Monitoring Policy')}</h3></div>
-      <div className="cfg-grid">
-        <div className="cfg-field">
-          <label>{tr('敏感文件前缀', 'Sensitive File Prefixes')}</label>
-          <textarea rows={4} value={sensitivePrefixes} onChange={e => setSensitivePrefixes(e.target.value)} placeholder="/etc/shadow&#10;/etc/ssl&#10;/root/.ssh" />
-          <span className="cfg-hint">{tr('每行一个路径前缀，匹配的文件访问将触发告警', 'One path prefix per line; matching file access triggers alerts')}</span>
-        </div>
-        <div className="cfg-field">
-          <label>{tr('可执行白名单前缀', 'Exec Whitelist Prefixes')}</label>
-          <textarea rows={4} value={execWhitelist} onChange={e => setExecWhitelist(e.target.value)} placeholder="/usr/bin&#10;/usr/sbin" />
-          <span className="cfg-hint">{tr('允许的 execve 路径前缀，不在白名单内的将触发告警', 'Allowed execve path prefixes; non-whitelisted paths trigger alerts')}</span>
-        </div>
-        <div className="cfg-field">
-          <label>{tr('监控服务', 'Monitored Services')}</label>
-          <textarea rows={3} value={monitoredServices} onChange={e => setMonitoredServices(e.target.value)} placeholder="sshd.service&#10;nginx.service" />
-          <span className="cfg-hint">{tr('systemd unit 名称，自动追踪其 PID', 'Systemd unit names; PIDs are tracked automatically')}</span>
-        </div>
-        <div className="cfg-field">
-          <label>{tr('阻断端口', 'Blocked Ports')}</label>
-          <input type="text" value={blockedPorts} onChange={e => setBlockedPorts(e.target.value)} placeholder="4444, 31337" />
-          <span className="cfg-hint">{tr('逗号分隔端口号，匹配的连接将被阻断', 'Comma-separated port numbers; matching connections are blocked')}</span>
-        </div>
-      </div>
-
-      <h4 className="cfg-section-title">{tr('基线阈值（每 30 秒窗口）', 'Baseline Thresholds (per 30s window)')}</h4>
+      <div className="card-header"><h3>{tr('基线阈值（每 30 秒窗口）', 'Baseline Thresholds (per 30s window)')}</h3></div>
+      <p className="card-desc">{tr('超过阈值的系统调用频率将触发中危告警。', 'Syscall frequencies exceeding thresholds trigger medium-level alerts.')}</p>
       <div className="threshold-grid">
         {['file_io', 'process', 'privilege', 'network', 'hotpatch'].map(k => (
           <div key={k} className="threshold-item">
@@ -1167,9 +1354,8 @@ function GeneralPolicyPanel({ policy, setPolicy, saving, setSaving, flash, lang,
           </div>
         ))}
       </div>
-
       <button className="btn-primary" onClick={handleSave} disabled={saving}>
-        {saving ? tr('保存中...', 'Saving...') : tr('保存通用策略', 'Save General Policy')}
+        {saving ? tr('保存中...', 'Saving...') : tr('保存阈值', 'Save Thresholds')}
       </button>
     </div>
   )
@@ -1177,10 +1363,13 @@ function GeneralPolicyPanel({ policy, setPolicy, saving, setSaving, flash, lang,
 
 const emptyRule: RateLimitRule = { cidr: '', max_conn_per_sec: 100, action: 'log', enabled: true }
 
-function RateLimitPanel({ rules, setRules, flash, tr }: {
-  rules: RateLimitRule[]; setRules: (r: RateLimitRule[]) => void; flash: (msg: string) => void; tr: (zh: string, en: string) => string
+function RateLimitPanel({ rules, setRules, toggle, flash, tr }: {
+  rules: RateLimitRule[]; setRules: (r: RateLimitRule[]) => void
+  toggle: (section: string, index: number, enabled: boolean) => void
+  flash: (msg: string) => void; tr: (zh: string, en: string) => string
 }) {
   const [draft, setDraft] = useState<RateLimitRule>({ ...emptyRule })
+  const enabled = rules.filter(r => r.enabled).length
 
   const handleAdd = async () => {
     if (!draft.cidr.trim()) { flash(tr('CIDR 必填', 'CIDR is required')); return }
@@ -1198,53 +1387,35 @@ function RateLimitPanel({ rules, setRules, flash, tr }: {
     } catch { flash(tr('删除失败', 'Delete failed')) }
   }
 
-  const handleToggle = async (index: number) => {
-    const rule = { ...rules[index], enabled: !rules[index].enabled }
-    try {
-      const r = await fetch('/api/v1/config/rate-limit', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ index, ...rule }) })
-      if (r.ok) { setRules(await r.json()); flash(tr('规则已更新', 'Rule updated')) }
-    } catch { flash(tr('更新失败', 'Update failed')) }
-  }
-
   return (
     <div className="card">
       <div className="card-header">
         <h3>{tr('IP 限流规则', 'IP Rate Limiting Rules')}</h3>
-        <span className="card-badge">{rules.length} {tr('条规则', 'rules')}</span>
+        <span className="card-badge">{enabled}/{rules.length} {tr('启用', 'enabled')}</span>
       </div>
       <p className="card-desc">{tr(
-        '配置基于 CIDR 的连接速率限制。规则由网络遥测代理在内核态实时评估，支持记录、阻断和限速三种动作。',
-        'Define per-CIDR connection rate limits. Rules are evaluated by the network telemetry agent in kernel space at runtime, supporting log, block, and throttle actions.'
+        '配置基于 CIDR 的连接速率限制。规则由网络遥测代理在内核态实时评估。',
+        'Define per-CIDR connection rate limits. Rules are evaluated by the network telemetry agent in kernel space at runtime.'
       )}</p>
 
       {rules.length > 0 && (
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>CIDR</th>
-                <th>{tr('最大连接/秒', 'Max Conn/s')}</th>
-                <th>{tr('动作', 'Action')}</th>
-                <th>{tr('状态', 'Status')}</th>
-                <th>{tr('操作', 'Operations')}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rules.map((rule, i) => (
-                <tr key={i} className={rule.enabled ? '' : 'row-disabled'}>
-                  <td><code>{rule.cidr}</code></td>
-                  <td>{rule.max_conn_per_sec}</td>
-                  <td><span className={`action-tag action-${rule.action}`}>{rule.action}</span></td>
-                  <td>
-                    <button className={`toggle-btn ${rule.enabled ? 'on' : 'off'}`} onClick={() => handleToggle(i)}>
-                      {rule.enabled ? tr('启用', 'ON') : tr('禁用', 'OFF')}
-                    </button>
-                  </td>
-                  <td><button className="btn-danger-sm" onClick={() => handleDelete(i)}>{tr('删除', 'Delete')}</button></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        <div className="toggle-list">
+          {rules.map((rule, i) => (
+            <div key={i} className={`toggle-row ${rule.enabled ? '' : 'disabled'}`}>
+              <button
+                className={`switch ${rule.enabled ? 'on' : 'off'}`}
+                onClick={() => toggle('rate_limit_rules', i, !rule.enabled)}
+              >
+                <span className="switch-knob" />
+              </button>
+              <div className="toggle-detail">
+                <code>{rule.cidr}</code>
+                <span className="toggle-meta">{rule.max_conn_per_sec} conn/s</span>
+                <span className={`action-tag action-${rule.action}`}>{rule.action}</span>
+              </div>
+              <button className="btn-danger-sm" onClick={() => handleDelete(i)}>{tr('删除', 'Delete')}</button>
+            </div>
+          ))}
         </div>
       )}
 
@@ -1258,10 +1429,6 @@ function RateLimitPanel({ rules, setRules, flash, tr }: {
             <option value="block">{tr('阻断', 'Block')}</option>
             <option value="throttle">{tr('限速', 'Throttle')}</option>
           </select>
-          <label className="check-label">
-            <input type="checkbox" checked={draft.enabled} onChange={e => setDraft({ ...draft, enabled: e.target.checked })} />
-            {tr('启用', 'Enabled')}
-          </label>
           <button className="btn-primary" onClick={handleAdd}>{tr('添加', 'Add')}</button>
         </div>
       </div>
@@ -1269,17 +1436,20 @@ function RateLimitPanel({ rules, setRules, flash, tr }: {
   )
 }
 
-const emptyTarget: HotpatchTarget = { binary: '', symbol: '', pid: null }
+const emptyTarget: HotpatchTarget = { binary: '', symbol: '', pid: null, enabled: true }
 
-function HotpatchConfigPanel({ targets, setTargets, flash, tr }: {
-  targets: HotpatchTarget[]; setTargets: (t: HotpatchTarget[]) => void; flash: (msg: string) => void; tr: (zh: string, en: string) => string
+function HotpatchConfigPanel({ targets, setTargets, toggle, flash, tr }: {
+  targets: HotpatchTarget[]; setTargets: (t: HotpatchTarget[]) => void
+  toggle: (section: string, index: number, enabled: boolean) => void
+  flash: (msg: string) => void; tr: (zh: string, en: string) => string
 }) {
   const [draft, setDraft] = useState<HotpatchTarget>({ ...emptyTarget })
   const [reloading, setReloading] = useState(false)
+  const enabled = targets.filter(t => t.enabled).length
 
   const handleAdd = async () => {
     if (!draft.binary.trim() || !draft.symbol.trim()) { flash(tr('二进制路径和符号名必填', 'Binary path and symbol name are required')); return }
-    const payload = { binary: draft.binary.trim(), symbol: draft.symbol.trim(), pid: draft.pid || null }
+    const payload = { binary: draft.binary.trim(), symbol: draft.symbol.trim(), pid: draft.pid || null, enabled: true }
     try {
       const r = await fetch('/api/v1/config/hotpatch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
       if (r.ok) { setTargets(await r.json()); setDraft({ ...emptyTarget }); flash(tr('热补丁目标已添加', 'Hotpatch target added')) }
@@ -1315,36 +1485,32 @@ function HotpatchConfigPanel({ targets, setTargets, flash, tr }: {
           <button className="btn-reload" onClick={handleReload} disabled={reloading || targets.length === 0}>
             {reloading ? tr('重载中...', 'Reloading...') : tr('重载探针', 'Reload Probes')}
           </button>
-          <span className="card-badge">{targets.length} {tr('个目标', 'targets')}</span>
+          <span className="card-badge">{enabled}/{targets.length} {tr('启用', 'enabled')}</span>
         </div>
       </div>
       <p className="card-desc">{tr(
-        '通过 uprobe/uretprobe 在运行时挂载到高危函数入口和出口，结合参数校验与返回值控制（bpf_override_return）实现不停机防护。动态符号解析器自动解析 ELF 符号表和 /proc/[pid]/maps 以克服 ASLR。',
-        'Attach uprobe/uretprobe probes to vulnerable functions at runtime. The hot-patching agent validates arguments and can force error returns via bpf_override_return without restarting services. The dynamic symbol resolver automatically parses ELF symbol tables and /proc/[pid]/maps to bypass ASLR.'
+        '通过 uprobe/uretprobe 在运行时挂载到高危函数。禁用的目标不会被挂载。',
+        'Attach uprobe/uretprobe probes to vulnerable functions at runtime. Disabled targets are not attached.'
       )}</p>
 
       {targets.length > 0 && (
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>{tr('二进制文件', 'Binary')}</th>
-                <th>{tr('符号', 'Symbol')}</th>
-                <th>PID</th>
-                <th>{tr('操作', 'Operations')}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {targets.map((t, i) => (
-                <tr key={i}>
-                  <td><code>{t.binary}</code></td>
-                  <td><code>{t.symbol}</code></td>
-                  <td>{t.pid ?? tr('全部', 'all')}</td>
-                  <td><button className="btn-danger-sm" onClick={() => handleDelete(i)}>{tr('删除', 'Delete')}</button></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        <div className="toggle-list">
+          {targets.map((t, i) => (
+            <div key={i} className={`toggle-row ${t.enabled ? '' : 'disabled'}`}>
+              <button
+                className={`switch ${t.enabled ? 'on' : 'off'}`}
+                onClick={() => toggle('hotpatch_targets', i, !t.enabled)}
+              >
+                <span className="switch-knob" />
+              </button>
+              <div className="toggle-detail">
+                <code>{t.binary}</code>
+                <span className="toggle-meta">{t.symbol}</span>
+                <span className="toggle-meta">PID: {t.pid ?? tr('全部', 'all')}</span>
+              </div>
+              <button className="btn-danger-sm" onClick={() => handleDelete(i)}>{tr('删除', 'Delete')}</button>
+            </div>
+          ))}
         </div>
       )}
 

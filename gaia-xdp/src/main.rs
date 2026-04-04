@@ -65,19 +65,39 @@ struct Opt {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct MonitorPolicy {
     #[serde(default)]
-    sensitive_prefixes: Vec<String>,
+    sensitive_prefixes: Vec<ToggleItem>,
     #[serde(default)]
-    monitored_services: Vec<String>,
+    monitored_services: Vec<ToggleItem>,
     #[serde(default)]
-    exec_whitelist_prefixes: Vec<String>,
+    exec_whitelist_prefixes: Vec<ToggleItem>,
     #[serde(default)]
-    blocked_ports: Vec<u16>,
+    blocked_ports: Vec<TogglePort>,
     #[serde(default)]
     baseline_thresholds: HashMap<String, u32>,
     #[serde(default)]
     hotpatch: HotpatchPolicy,
     #[serde(default)]
     rate_limit_rules: Vec<RateLimitRule>,
+}
+
+/// A simple string item with an enabled/disabled toggle.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ToggleItem {
+    value: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+/// A port number with an enabled/disabled toggle.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct TogglePort {
+    port: u16,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -92,6 +112,8 @@ struct HotpatchTarget {
     symbol: String,
     #[serde(default)]
     pid: Option<u32>,
+    #[serde(default = "default_true")]
+    enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -116,10 +138,23 @@ enum RateLimitAction {
 impl Default for MonitorPolicy {
     fn default() -> Self {
         Self {
-            sensitive_prefixes: vec!["/etc/shadow".into(), "/etc/ssl".into(), "/root/.ssh".into()],
-            monitored_services: vec!["sshd.service".into(), "nginx.service".into()],
-            exec_whitelist_prefixes: vec!["/usr/bin".into(), "/usr/sbin".into()],
-            blocked_ports: vec![4444, 31337],
+            sensitive_prefixes: vec![
+                ToggleItem { value: "/etc/shadow".into(), enabled: true },
+                ToggleItem { value: "/etc/ssl".into(), enabled: true },
+                ToggleItem { value: "/root/.ssh".into(), enabled: true },
+            ],
+            monitored_services: vec![
+                ToggleItem { value: "sshd.service".into(), enabled: true },
+                ToggleItem { value: "nginx.service".into(), enabled: true },
+            ],
+            exec_whitelist_prefixes: vec![
+                ToggleItem { value: "/usr/bin".into(), enabled: true },
+                ToggleItem { value: "/usr/sbin".into(), enabled: true },
+            ],
+            blocked_ports: vec![
+                TogglePort { port: 4444, enabled: true },
+                TogglePort { port: 31337, enabled: true },
+            ],
             baseline_thresholds: HashMap::from([
                 ("file_io".to_string(), 200),
                 ("process".to_string(), 80),
@@ -367,7 +402,7 @@ fn attach_tracepoint(bpf: &mut Ebpf, prog_name: &str, category: &str, name: &str
     Ok(())
 }
 
-fn apply_blocked_ports(bpf: &mut Ebpf, blocked_ports: &[u16]) -> Result<()> {
+fn apply_blocked_ports(bpf: &mut Ebpf, blocked_ports: &[TogglePort]) -> Result<()> {
     let map = bpf
         .map_mut("BLOCKED_PORTS")
         .context("missing BLOCKED_PORTS map")?;
@@ -377,12 +412,14 @@ fn apply_blocked_ports(bpf: &mut Ebpf, blocked_ports: &[u16]) -> Result<()> {
     for k in existing {
         let _ = ports.remove(&k);
     }
-    for port in blocked_ports {
+    // Only insert enabled ports
+    let active: Vec<u16> = blocked_ports.iter().filter(|p| p.enabled).map(|p| p.port).collect();
+    for port in &active {
         ports
             .insert(*port, 1, 0)
             .with_context(|| format!("insert blocked port {port}"))?;
     }
-    info!("blocked ports configured: {blocked_ports:?}");
+    info!("blocked ports configured: {active:?} ({} enabled / {} total)", active.len(), blocked_ports.len());
     Ok(())
 }
 
@@ -463,7 +500,7 @@ fn parse_cidr(cidr: &str) -> Option<(Ipv4Addr, u8)> {
     }
 }
 
-fn sync_bpf_blocked_ports(shared: &Shared, blocked_ports: &[u16]) {
+fn sync_bpf_blocked_ports(shared: &Shared, blocked_ports: &[TogglePort]) {
     if let Ok(mut bpf) = shared.bpf.lock() {
         if let Err(err) = apply_blocked_ports(&mut bpf, blocked_ports) {
             warn!("failed to sync blocked ports to BPF: {err:#}");
@@ -500,8 +537,8 @@ fn sync_bpf_hotpatch_pids(shared: &Shared, targets: &[HotpatchTarget]) {
         for k in existing {
             let _ = pid_map.remove(&k);
         }
-        // Insert PIDs from targets
-        for target in targets {
+        // Insert PIDs from enabled targets only
+        for target in targets.iter().filter(|t| t.enabled) {
             if let Some(pid) = target.pid {
                 let entry = HotpatchPidEntry {
                     active: 1,
@@ -510,7 +547,8 @@ fn sync_bpf_hotpatch_pids(shared: &Shared, targets: &[HotpatchTarget]) {
                 let _ = pid_map.insert(pid, entry, 0);
             }
         }
-        info!("hotpatch PID filter updated: {} target(s)", targets.len());
+        let enabled = targets.iter().filter(|t| t.enabled).count();
+        info!("hotpatch PID filter updated: {} enabled / {} total", enabled, targets.len());
     }
 }
 
@@ -519,7 +557,8 @@ fn attach_hotpatch_targets(
     targets: &[HotpatchTarget],
     shared: &Shared,
 ) -> Result<()> {
-    if targets.is_empty() {
+    let enabled_targets: Vec<&HotpatchTarget> = targets.iter().filter(|t| t.enabled).collect();
+    if enabled_targets.is_empty() {
         return Ok(());
     }
 
@@ -542,7 +581,7 @@ fn attach_hotpatch_targets(
         let _ = exit.load();
     }
 
-    for target in targets {
+    for target in &enabled_targets {
         let binary_path = Path::new(&target.binary);
         if !binary_path.exists() {
             warn!(
@@ -658,14 +697,15 @@ fn spawn_service_tracker(shared: Shared) {
     tokio::spawn(async move {
         loop {
             let services = shared.policy.read().await.monitored_services.clone();
-            if services.is_empty() {
+            let enabled: Vec<&ToggleItem> = services.iter().filter(|s| s.enabled).collect();
+            if enabled.is_empty() {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 continue;
             }
             let mut mapping = HashMap::<String, Vec<u32>>::new();
-            for service in &services {
-                if let Some(pid) = query_service_pid(service).await {
-                    mapping.insert(service.clone(), vec![pid]);
+            for service in &enabled {
+                if let Some(pid) = query_service_pid(&service.value).await {
+                    mapping.insert(service.value.clone(), vec![pid]);
                 }
             }
             let mut state = shared.runtime.write().await;
@@ -890,23 +930,25 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
 }
 
 fn exec_path_whitelisted(path: &str, policy: &MonitorPolicy) -> bool {
-    if policy.exec_whitelist_prefixes.is_empty() {
+    let enabled: Vec<&str> = policy.exec_whitelist_prefixes.iter()
+        .filter(|p| p.enabled)
+        .map(|p| p.value.as_str())
+        .collect();
+    if enabled.is_empty() {
         return true;
     }
-    policy
-        .exec_whitelist_prefixes
-        .iter()
-        .any(|prefix| path.starts_with(prefix))
+    enabled.iter().any(|prefix| path.starts_with(prefix))
 }
 
 fn file_path_sensitive(path: &str, policy: &MonitorPolicy) -> bool {
-    if policy.sensitive_prefixes.is_empty() {
+    let enabled: Vec<&str> = policy.sensitive_prefixes.iter()
+        .filter(|p| p.enabled)
+        .map(|p| p.value.as_str())
+        .collect();
+    if enabled.is_empty() {
         return true;
     }
-    policy
-        .sensitive_prefixes
-        .iter()
-        .any(|prefix| path.starts_with(prefix))
+    enabled.iter().any(|prefix| path.starts_with(prefix))
 }
 
 fn push_alert(state: &mut RuntimeState, level: &str, reason: String, event: &EventRecord) {
@@ -1090,6 +1132,7 @@ async fn run_http_server(shared: Shared, addr: String) -> Result<()> {
             "/api/v1/config/hotpatch/{index}",
             axum::routing::delete(api_delete_hotpatch),
         )
+        .route("/api/v1/config/toggle", post(api_toggle_item))
         .route("/api/v1/reload-hotpatch", post(api_reload_hotpatch))
         .with_state(shared)
         .layer(cors)
@@ -1191,13 +1234,13 @@ async fn api_get_config(State(shared): State<Shared>) -> Json<MonitorPolicy> {
 #[derive(Debug, Deserialize)]
 struct ConfigUpdate {
     #[serde(default)]
-    sensitive_prefixes: Option<Vec<String>>,
+    sensitive_prefixes: Option<Vec<ToggleItem>>,
     #[serde(default)]
-    monitored_services: Option<Vec<String>>,
+    monitored_services: Option<Vec<ToggleItem>>,
     #[serde(default)]
-    exec_whitelist_prefixes: Option<Vec<String>>,
+    exec_whitelist_prefixes: Option<Vec<ToggleItem>>,
     #[serde(default)]
-    blocked_ports: Option<Vec<u16>>,
+    blocked_ports: Option<Vec<TogglePort>>,
     #[serde(default)]
     baseline_thresholds: Option<HashMap<String, u32>>,
 }
@@ -1337,6 +1380,77 @@ async fn api_delete_hotpatch(
     sync_bpf_hotpatch_pids(&shared, &targets);
     persist_policy(&shared).await;
     Json(targets)
+}
+
+// ── Toggle API: enable/disable any config item by section + index ──
+
+#[derive(Debug, Deserialize)]
+struct ToggleRequest {
+    section: String,
+    index: usize,
+    enabled: bool,
+}
+
+async fn api_toggle_item(
+    State(shared): State<Shared>,
+    Json(req): Json<ToggleRequest>,
+) -> Result<Json<MonitorPolicy>, StatusCode> {
+    let mut policy = shared.policy.write().await;
+    match req.section.as_str() {
+        "sensitive_prefixes" => {
+            if req.index < policy.sensitive_prefixes.len() {
+                policy.sensitive_prefixes[req.index].enabled = req.enabled;
+            }
+        }
+        "monitored_services" => {
+            if req.index < policy.monitored_services.len() {
+                policy.monitored_services[req.index].enabled = req.enabled;
+            }
+        }
+        "exec_whitelist_prefixes" => {
+            if req.index < policy.exec_whitelist_prefixes.len() {
+                policy.exec_whitelist_prefixes[req.index].enabled = req.enabled;
+            }
+        }
+        "blocked_ports" => {
+            if req.index < policy.blocked_ports.len() {
+                policy.blocked_ports[req.index].enabled = req.enabled;
+            }
+            let ports = policy.blocked_ports.clone();
+            let snapshot = policy.clone();
+            drop(policy);
+            sync_bpf_blocked_ports(&shared, &ports);
+            persist_policy(&shared).await;
+            return Ok(Json(snapshot));
+        }
+        "rate_limit_rules" => {
+            if req.index < policy.rate_limit_rules.len() {
+                policy.rate_limit_rules[req.index].enabled = req.enabled;
+            }
+            let rules = policy.rate_limit_rules.clone();
+            let snapshot = policy.clone();
+            drop(policy);
+            sync_bpf_rate_limits(&shared, &rules);
+            persist_policy(&shared).await;
+            return Ok(Json(snapshot));
+        }
+        "hotpatch_targets" => {
+            if req.index < policy.hotpatch.targets.len() {
+                policy.hotpatch.targets[req.index].enabled = req.enabled;
+            }
+            let targets = policy.hotpatch.targets.clone();
+            let snapshot = policy.clone();
+            drop(policy);
+            sync_bpf_hotpatch_pids(&shared, &targets);
+            persist_policy(&shared).await;
+            return Ok(Json(snapshot));
+        }
+        _ => return Err(StatusCode::BAD_REQUEST),
+    }
+    let snapshot = policy.clone();
+    drop(policy);
+    persist_policy(&shared).await;
+    Ok(Json(snapshot))
 }
 
 // ── Reload hotpatch targets (re-attach uprobe probes) ──

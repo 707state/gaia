@@ -1,7 +1,50 @@
-sensitive_prefixes = ["/etc/shadow", "/etc/ssl", "/root/.ssh", "/var/lib/gaia"]
-monitored_services = ["sshd.service", "nginx.service"]
-exec_whitelist_prefixes = ["/usr/bin", "/usr/sbin", "/bin", "/sbin"]
-blocked_ports = [4444, 31337]
+[[sensitive_prefixes]]
+value = "/etc/shadow"
+enabled = true
+
+[[sensitive_prefixes]]
+value = "/etc/ssl"
+enabled = true
+
+[[sensitive_prefixes]]
+value = "/root/.ssh"
+enabled = true
+
+[[sensitive_prefixes]]
+value = "/var/lib/gaia"
+enabled = true
+
+[[monitored_services]]
+value = "sshd.service"
+enabled = true
+
+[[monitored_services]]
+value = "nginx.service"
+enabled = true
+
+[[exec_whitelist_prefixes]]
+value = "/usr/bin"
+enabled = true
+
+[[exec_whitelist_prefixes]]
+value = "/usr/sbin"
+enabled = true
+
+[[exec_whitelist_prefixes]]
+value = "/bin"
+enabled = true
+
+[[exec_whitelist_prefixes]]
+value = "/sbin"
+enabled = true
+
+[[blocked_ports]]
+port = 4444
+enabled = true
+
+[[blocked_ports]]
+port = 31337
+enabled = true
 
 [baseline_thresholds]
 file_io = 200
@@ -21,3 +64,4 @@ hotpatch = 50
 # [[hotpatch.targets]]
 # binary = "/usr/sbin/nginx"
 # symbol = "ngx_http_process_request"
+# enabled = true
