@@ -823,6 +823,25 @@ function HotpatchTab({ snapshot, lang, tr }: {
   const hotpatchEvents = snapshot.events.filter(e => e.kind === 'hotpatch')
   const isActive = snapshot.features.hotpatch_agent
   const symbolOk = snapshot.features.symbol_resolver
+  const [reloading, setReloading] = useState(false)
+  const [reloadMsg, setReloadMsg] = useState('')
+
+  const handleReload = async () => {
+    setReloading(true)
+    setReloadMsg('')
+    try {
+      const r = await fetch('/api/v1/reload-hotpatch', { method: 'POST' })
+      const data = await r.json() as { success: boolean; message: string; targets_count: number }
+      setReloadMsg(data.success
+        ? tr(`探针重载成功，已处理 ${data.targets_count} 个目标`, `Reload succeeded: ${data.targets_count} target(s) processed`)
+        : tr('重载失败: ', 'Reload failed: ') + data.message
+      )
+    } catch {
+      setReloadMsg(tr('重载失败: 网络错误', 'Reload failed: network error'))
+    }
+    setReloading(false)
+    setTimeout(() => setReloadMsg(''), 5000)
+  }
 
   return (
     <div className="tab-content">
@@ -832,6 +851,8 @@ function HotpatchTab({ snapshot, lang, tr }: {
           'The Hot-patching Agent (Active Defense) uses kprobe/kretprobe and uprobe/uretprobe hooks to dynamically deploy patches to vulnerable functions. It validates arguments at function entry or forces error returns via bpf_override_return, neutralizing exploits at runtime without service restarts.'
         )}</p>
       </div>
+
+      {reloadMsg && <div className="toast">{reloadMsg}</div>}
 
       <div className="stats-grid stats-3">
         <div className="stat-card accent-blue">
@@ -860,6 +881,9 @@ function HotpatchTab({ snapshot, lang, tr }: {
       <div className="card">
         <div className="card-header">
           <h3>{tr('热补丁事件流', 'Hotpatch Event Stream')}</h3>
+          <button className="btn-reload" onClick={handleReload} disabled={reloading}>
+            {reloading ? tr('重载中...', 'Reloading...') : tr('重载探针', 'Reload Probes')}
+          </button>
         </div>
         {hotpatchEvents.length > 0 ? (
           <EventTable events={hotpatchEvents} lang={lang} tr={tr} />
@@ -1251,6 +1275,7 @@ function HotpatchConfigPanel({ targets, setTargets, flash, tr }: {
   targets: HotpatchTarget[]; setTargets: (t: HotpatchTarget[]) => void; flash: (msg: string) => void; tr: (zh: string, en: string) => string
 }) {
   const [draft, setDraft] = useState<HotpatchTarget>({ ...emptyTarget })
+  const [reloading, setReloading] = useState(false)
 
   const handleAdd = async () => {
     if (!draft.binary.trim() || !draft.symbol.trim()) { flash(tr('二进制路径和符号名必填', 'Binary path and symbol name are required')); return }
@@ -1269,11 +1294,29 @@ function HotpatchConfigPanel({ targets, setTargets, flash, tr }: {
     } catch { flash(tr('删除失败', 'Delete failed')) }
   }
 
+  const handleReload = async () => {
+    setReloading(true)
+    try {
+      const r = await fetch('/api/v1/reload-hotpatch', { method: 'POST' })
+      const data = await r.json() as { success: boolean; message: string; targets_count: number }
+      flash(data.success
+        ? tr(`探针重载成功，已处理 ${data.targets_count} 个目标`, `Reload succeeded: ${data.targets_count} target(s) processed`)
+        : tr('重载失败: ', 'Reload failed: ') + data.message
+      )
+    } catch { flash(tr('重载失败: 网络错误', 'Reload failed: network error')) }
+    setReloading(false)
+  }
+
   return (
     <div className="card">
       <div className="card-header">
         <h3>{tr('热补丁目标配置', 'Hot-Patch Target Configuration')}</h3>
-        <span className="card-badge">{targets.length} {tr('个目标', 'targets')}</span>
+        <div className="header-actions">
+          <button className="btn-reload" onClick={handleReload} disabled={reloading || targets.length === 0}>
+            {reloading ? tr('重载中...', 'Reloading...') : tr('重载探针', 'Reload Probes')}
+          </button>
+          <span className="card-badge">{targets.length} {tr('个目标', 'targets')}</span>
+        </div>
       </div>
       <p className="card-desc">{tr(
         '通过 uprobe/uretprobe 在运行时挂载到高危函数入口和出口，结合参数校验与返回值控制（bpf_override_return）实现不停机防护。动态符号解析器自动解析 ELF 符号表和 /proc/[pid]/maps 以克服 ASLR。',
