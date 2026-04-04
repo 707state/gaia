@@ -12,7 +12,8 @@ use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
     extract::State,
-    http::{HeaderValue, Method, header},
+    http::{HeaderValue, Method, StatusCode, Uri, header},
+    response::{Html, IntoResponse, Response},
     routing::get,
 };
 use aya::{
@@ -51,6 +52,10 @@ struct Opt {
     config: PathBuf,
     #[arg(long, default_value = "0.0.0.0:17890")]
     web_listen: String,
+    /// Path to the WebUI dist directory (built by `pnpm build` in gaia-webui/).
+    /// If provided, the HTTP server will serve the SPA from this directory.
+    #[arg(long)]
+    webui_dir: Option<PathBuf>,
 }
 
 // ── Policy config (YAML / TOML) ──
@@ -214,6 +219,7 @@ struct Shared {
     bpf: Arc<Mutex<Ebpf>>,
     hotpatch_active: Arc<Mutex<bool>>,
     symbol_resolver_ok: Arc<Mutex<bool>>,
+    webui_dir: Option<PathBuf>,
 }
 
 // ── main ──
@@ -243,6 +249,7 @@ async fn main() -> Result<()> {
         bpf: Arc::new(Mutex::new(bpf)),
         hotpatch_active: Arc::new(Mutex::new(false)),
         symbol_resolver_ok: Arc::new(Mutex::new(true)),
+        webui_dir: opt.webui_dir.clone(),
     };
 
     // Hotpatch targets are best-effort: failure to attach should not crash.
@@ -926,6 +933,8 @@ async fn run_http_server(shared: Shared, addr: String) -> Result<()> {
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers(vec![header::CONTENT_TYPE, header::ACCEPT]);
 
+    let webui_dir = shared.webui_dir.clone();
+
     let app = Router::new()
         .route("/api/v1/state", get(api_state))
         .route("/api/v1/config", get(api_get_config).post(api_update_config))
@@ -952,12 +961,46 @@ async fn run_http_server(shared: Shared, addr: String) -> Result<()> {
         .with_state(shared)
         .layer(cors);
 
+    // If a webui directory is provided, serve static files with SPA fallback
+    let app = if let Some(ref dir) = webui_dir {
+        if dir.exists() {
+            info!("serving WebUI from {}", dir.display());
+            let serve_dir = tower_http::services::ServeDir::new(dir)
+                .not_found_service(tower_http::services::ServeFile::new(dir.join("index.html")));
+            app.fallback_service(serve_dir)
+        } else {
+            warn!("webui directory not found: {}", dir.display());
+            app
+        }
+    } else {
+        // Serve a minimal redirect page when no webui dir is configured
+        app.fallback(fallback_handler)
+    };
+
     let listener = TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind http listener {addr}"))?;
     info!("web api listening on http://{addr}");
     axum::serve(listener, app).await.context("serve axum")?;
     Ok(())
+}
+
+async fn fallback_handler(uri: Uri) -> Response {
+    // For API paths that don't exist, return 404
+    if uri.path().starts_with("/api/") {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    // For everything else, return a helpful page
+    Html(r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>GAIA</title>
+<style>body{font-family:system-ui;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#f0f4f8;color:#1e293b}
+.c{text-align:center;max-width:480px;padding:40px}h1{font-size:48px;margin:0}p{color:#64748b;line-height:1.6}code{background:#e2e8f0;padding:2px 8px;border-radius:4px;font-size:13px}</style>
+</head><body><div class="c">
+<h1>🛡️ GAIA</h1>
+<p>Security Monitoring Plane is running.<br>
+The API is available at <code>/api/v1/state</code>.</p>
+<p>To serve the WebUI, build it with <code>cd gaia-webui && pnpm build</code> and restart with <code>--webui-dir gaia-webui/dist</code>.</p>
+</div></body></html>"#.to_string()).into_response()
 }
 
 async fn api_state(State(shared): State<Shared>) -> Json<Snapshot> {

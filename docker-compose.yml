@@ -1,0 +1,85 @@
+# =============================================================================
+# Gaia — docker compose
+#
+# Services:
+#   gaia      — production-like: compiled binary + WebUI served on :17890
+#   gaia-dev  — development: hot-reload front-end (Vite :5173) + bind-mounted
+#               source for rapid Rust iteration
+#
+# Quick start (production image):
+#   docker compose up gaia --build
+#
+# Quick start (dev mode — front-end hot-reload only):
+#   docker compose up gaia-dev
+#
+# NOTE: eBPF programs require a privileged Linux host with kernel 5.10+ and
+#       CONFIG_DEBUG_INFO_BTF=y.  Running on macOS/Windows requires a real
+#       Linux VM (Docker Desktop's LinuxKit does NOT expose /sys/kernel/btf).
+# =============================================================================
+
+services:
+
+  # ── Production / integration build ───────────────────────────────────────
+  gaia:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: gaia:latest
+    container_name: gaia
+    restart: unless-stopped
+
+    # eBPF requires elevated privileges and access to the BPF filesystem
+    privileged: true
+    pid: host          # needed for uprobe / process visibility
+
+    volumes:
+      # BTF info for CO-RE
+      - /sys/kernel/btf:/sys/kernel/btf:ro
+      # BPF filesystem (maps, pinned programs)
+      - /sys/fs/bpf:/sys/fs/bpf
+      # Tracefs for tracepoints
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+      # Override config without rebuild
+      - ./gaia.toml:/etc/gaia/gaia.toml:ro
+
+    ports:
+      - "17890:17890"
+
+    environment:
+      RUST_LOG: "info"
+
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:17890/api/v1/state"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── Development helper: Vite dev server with HMR ─────────────────────────
+  # This service only handles the front-end.  For the Rust daemon use the
+  # host directly (cargo run) or the `gaia` service above.
+  gaia-dev-ui:
+    image: node:22-slim
+    container_name: gaia-dev-ui
+    working_dir: /app
+    command: sh -c "corepack enable && pnpm install && pnpm run dev --host 0.0.0.0"
+    volumes:
+      - ./gaia-webui:/app
+      # Isolate node_modules to the container so host OS differences
+      # (macOS vs Linux) don't cause issues
+      - gaia_node_modules:/app/node_modules
+    ports:
+      - "5173:5173"
+    environment:
+      # Proxy /api requests to the Rust daemon (running on the host or in
+      # the `gaia` service above).  Vite reads this via the proxy config in
+      # vite.config.ts; set the actual backend URL here if it differs.
+      VITE_API_BASE: "http://host.docker.internal:17890"
+    # Start the UI dev server even without the backend running
+    profiles:
+      - dev
+
+volumes:
+  gaia_node_modules:
+    driver: local

@@ -1,0 +1,25 @@
+# Rust build artefacts
+target/
+**/*.rs.bk
+
+# Node / front-end
+gaia-webui/node_modules/
+gaia-webui/dist/
+
+# Editor & OS noise
+.git/
+.gitignore
+.DS_Store
+**/.DS_Store
+*.sw?
+
+# IDE configs
+.vscode/
+.idea/
+.catpaw/
+
+# Docs (not needed in the image)
+*.md
+LICENSE*
+
+# Cargo lock is intentionally KEPT for reproducible builds
