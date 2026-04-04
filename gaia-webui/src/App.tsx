@@ -18,6 +18,20 @@ type EventRecord = {
 
 type AlertRecord = { level: string; reason: string; event: EventRecord }
 
+type NetIfTraffic = {
+  name: string
+  rx_bytes_per_sec: number
+  tx_bytes_per_sec: number
+  rx_packets_per_sec: number
+  tx_packets_per_sec: number
+}
+
+type TrafficSnapshot = {
+  interfaces: NetIfTraffic[]
+  total_rx_bytes_per_sec: number
+  total_tx_bytes_per_sec: number
+}
+
 type Snapshot = {
   features: {
     file_io_agent: boolean
@@ -31,6 +45,7 @@ type Snapshot = {
   services: Record<string, number[]>
   events: EventRecord[]
   alerts: AlertRecord[]
+  traffic: TrafficSnapshot
 }
 
 type RateLimitRule = {
@@ -132,6 +147,14 @@ const mockSnapshot: Snapshot = {
       comm: 'cron', detail: '/usr/sbin/logrotate',
     },
   ],
+  traffic: {
+    interfaces: [
+      { name: 'eth0', rx_bytes_per_sec: 125400, tx_bytes_per_sec: 48200, rx_packets_per_sec: 320, tx_packets_per_sec: 180 },
+      { name: 'lo', rx_bytes_per_sec: 8500, tx_bytes_per_sec: 8500, rx_packets_per_sec: 42, tx_packets_per_sec: 42 },
+    ],
+    total_rx_bytes_per_sec: 125400,
+    total_tx_bytes_per_sec: 48200,
+  },
   alerts: [
     {
       level: 'critical',
@@ -645,13 +668,19 @@ function ProcessTab({ snapshot, lang, tr }: {
 
 // ── Network Tab ──
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B/s`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB/s`
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB/s`
+}
+
 function NetworkTab({ snapshot, lang, tr }: {
   snapshot: Snapshot; lang: Lang; tr: (zh: string, en: string) => string
 }) {
   const netEvents = snapshot.events.filter(e => e.kind === 'network')
   const blockedEvents = netEvents.filter(e => e.action === 'blocked')
-  const rateLimited = netEvents.filter(e => e.action === 'rate_limited')
   const netAlerts = snapshot.alerts.filter(a => a.event.kind === 'network')
+  const traffic = snapshot.traffic
 
   return (
     <div className="tab-content">
@@ -662,12 +691,20 @@ function NetworkTab({ snapshot, lang, tr }: {
         )}</p>
       </div>
 
+      {/* Real-time traffic cards */}
       <div className="stats-grid">
-        <div className="stat-card accent-blue">
-          <div className="stat-icon">🌐</div>
+        <div className="stat-card accent-green">
+          <div className="stat-icon">📥</div>
           <div className="stat-body">
-            <span className="stat-label">{tr('网络事件', 'Network Events')}</span>
-            <span className="stat-value">{(snapshot.counters.network ?? 0).toLocaleString()}</span>
+            <span className="stat-label">{tr('入站流量', 'Inbound Traffic')}</span>
+            <span className="stat-value">{formatBytes(traffic?.total_rx_bytes_per_sec ?? 0)}</span>
+          </div>
+        </div>
+        <div className="stat-card accent-blue">
+          <div className="stat-icon">📤</div>
+          <div className="stat-body">
+            <span className="stat-label">{tr('出站流量', 'Outbound Traffic')}</span>
+            <span className="stat-value">{formatBytes(traffic?.total_tx_bytes_per_sec ?? 0)}</span>
           </div>
         </div>
         <div className="stat-card accent-red">
@@ -675,13 +712,6 @@ function NetworkTab({ snapshot, lang, tr }: {
           <div className="stat-body">
             <span className="stat-label">{tr('阻断连接', 'Blocked')}</span>
             <span className="stat-value">{blockedEvents.length}</span>
-          </div>
-        </div>
-        <div className="stat-card accent-purple">
-          <div className="stat-icon">⏱️</div>
-          <div className="stat-body">
-            <span className="stat-label">{tr('限流触发', 'Rate Limited')}</span>
-            <span className="stat-value">{rateLimited.length}</span>
           </div>
         </div>
         <div className="stat-card accent-orange">
@@ -693,9 +723,44 @@ function NetworkTab({ snapshot, lang, tr }: {
         </div>
       </div>
 
+      {/* Per-interface traffic table */}
+      {traffic && traffic.interfaces && traffic.interfaces.length > 0 && (
+        <div className="card">
+          <div className="card-header">
+            <h3>{tr('实时网卡流量', 'Real-time Interface Traffic')}</h3>
+            <span className="card-badge">{tr('每秒刷新', '1s refresh')}</span>
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>{tr('网卡', 'Interface')}</th>
+                  <th>{tr('入站速率', 'RX Rate')}</th>
+                  <th>{tr('出站速率', 'TX Rate')}</th>
+                  <th>{tr('入站包/秒', 'RX pkt/s')}</th>
+                  <th>{tr('出站包/秒', 'TX pkt/s')}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {traffic.interfaces.map(iface => (
+                  <tr key={iface.name}>
+                    <td><code>{iface.name}</code></td>
+                    <td className="traffic-rx">{formatBytes(iface.rx_bytes_per_sec)}</td>
+                    <td className="traffic-tx">{formatBytes(iface.tx_bytes_per_sec)}</td>
+                    <td>{iface.rx_packets_per_sec.toLocaleString()}</td>
+                    <td>{iface.tx_packets_per_sec.toLocaleString()}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
       <div className="card">
         <div className="card-header">
           <h3>{tr('网络事件流', 'Network Event Stream')}</h3>
+          <span className="card-badge">{tr('网络事件', 'Events')}: {(snapshot.counters.network ?? 0).toLocaleString()}</span>
         </div>
         {netEvents.length > 0 ? (
           <div className="table-wrap">

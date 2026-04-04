@@ -167,6 +167,30 @@ struct Snapshot {
     services: HashMap<String, Vec<u32>>,
     events: Vec<EventRecord>,
     alerts: Vec<AlertRecord>,
+    traffic: TrafficSnapshot,
+}
+
+/// Real-time network traffic data (bytes per second, sampled every 1s).
+#[derive(Debug, Clone, Serialize, Default)]
+struct TrafficSnapshot {
+    /// Per-interface traffic rates.
+    interfaces: Vec<NetIfTraffic>,
+    /// Aggregate inbound bytes/sec across all non-lo interfaces.
+    total_rx_bytes_per_sec: u64,
+    /// Aggregate outbound bytes/sec across all non-lo interfaces.
+    total_tx_bytes_per_sec: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NetIfTraffic {
+    name: String,
+    rx_bytes_per_sec: u64,
+    tx_bytes_per_sec: u64,
+    rx_packets_per_sec: u64,
+    tx_packets_per_sec: u64,
+    /// Cumulative counters (for reference).
+    rx_bytes_total: u64,
+    tx_bytes_total: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -194,6 +218,7 @@ struct RuntimeState {
     events: VecDeque<EventRecord>,
     alerts: VecDeque<AlertRecord>,
     baseline: BaselineState,
+    traffic: TrafficSnapshot,
 }
 
 impl RuntimeState {
@@ -207,6 +232,7 @@ impl RuntimeState {
                 window_started: Instant::now(),
                 counters: HashMap::new(),
             },
+            traffic: TrafficSnapshot::default(),
         }
     }
 }
@@ -252,22 +278,25 @@ async fn main() -> Result<()> {
         webui_dir: opt.webui_dir.clone(),
     };
 
-    // Hotpatch targets are best-effort: failure to attach should not crash.
+    // The kprobe guard was already attached in attach_agents(), so the
+    // hot-patch agent is active even when no uprobe targets are configured.
+    if let Ok(mut h) = shared.hotpatch_active.lock() {
+        *h = true;
+    }
+
+    // Hotpatch uprobe targets are best-effort: failure to attach should not crash.
     {
         let mut bpf_guard = shared.bpf.lock().unwrap();
         match attach_hotpatch_targets(&mut bpf_guard, &policy.hotpatch.targets, &shared) {
             Ok(()) => {
                 if !policy.hotpatch.targets.is_empty() {
-                    if let Ok(mut h) = shared.hotpatch_active.lock() {
-                        *h = true;
-                    }
                     info!(
-                        "hot-patch agent attached {} target(s)",
+                        "hot-patch agent attached {} uprobe target(s)",
                         policy.hotpatch.targets.len()
                     );
                 }
             }
-            Err(err) => warn!("hot-patch attach skipped: {err:#}"),
+            Err(err) => warn!("hot-patch uprobe attach skipped: {err:#}"),
         }
 
         let events = bpf_guard.take_map("EVENTS").context("missing EVENTS map")?;
@@ -276,6 +305,7 @@ async fn main() -> Result<()> {
     }
 
     spawn_service_tracker(shared.clone());
+    spawn_traffic_sampler(shared.clone());
 
     let web_state = shared.clone();
     let web_listen = opt.web_listen.clone();
@@ -665,6 +695,109 @@ async fn query_service_pid(service: &str) -> Option<u32> {
     (pid > 0).then_some(pid)
 }
 
+// ── Network traffic sampler ──
+
+/// Raw counters read from /proc/net/dev for a single interface.
+#[derive(Debug, Clone)]
+struct IfCounters {
+    name: String,
+    rx_bytes: u64,
+    tx_bytes: u64,
+    rx_packets: u64,
+    tx_packets: u64,
+}
+
+fn read_proc_net_dev() -> Vec<IfCounters> {
+    let content = match fs::read_to_string("/proc/net/dev") {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut result = Vec::new();
+    for line in content.lines().skip(2) {
+        // Format: "  iface: rx_bytes rx_packets ... tx_bytes tx_packets ..."
+        let line = line.trim();
+        let Some((name, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim().to_string();
+        let fields: Vec<u64> = rest
+            .split_whitespace()
+            .filter_map(|s| s.parse::<u64>().ok())
+            .collect();
+        if fields.len() >= 10 {
+            result.push(IfCounters {
+                name,
+                rx_bytes: fields[0],
+                rx_packets: fields[1],
+                tx_bytes: fields[8],
+                tx_packets: fields[9],
+            });
+        }
+    }
+    result
+}
+
+fn spawn_traffic_sampler(shared: Shared) {
+    tokio::spawn(async move {
+        let mut prev: Option<(Instant, Vec<IfCounters>)> = None;
+
+        loop {
+            let now = Instant::now();
+            let current = read_proc_net_dev();
+
+            if let Some((prev_time, ref prev_counters)) = prev {
+                let elapsed = now.duration_since(prev_time).as_secs_f64();
+                if elapsed > 0.1 {
+                    let mut interfaces = Vec::new();
+                    let mut total_rx: u64 = 0;
+                    let mut total_tx: u64 = 0;
+
+                    for cur in &current {
+                        if let Some(old) = prev_counters.iter().find(|p| p.name == cur.name) {
+                            let rx_bps =
+                                (cur.rx_bytes.saturating_sub(old.rx_bytes) as f64 / elapsed) as u64;
+                            let tx_bps =
+                                (cur.tx_bytes.saturating_sub(old.tx_bytes) as f64 / elapsed) as u64;
+                            let rx_pps = (cur.rx_packets.saturating_sub(old.rx_packets) as f64
+                                / elapsed) as u64;
+                            let tx_pps = (cur.tx_packets.saturating_sub(old.tx_packets) as f64
+                                / elapsed) as u64;
+
+                            // Exclude loopback from totals
+                            if cur.name != "lo" {
+                                total_rx += rx_bps;
+                                total_tx += tx_bps;
+                            }
+
+                            interfaces.push(NetIfTraffic {
+                                name: cur.name.clone(),
+                                rx_bytes_per_sec: rx_bps,
+                                tx_bytes_per_sec: tx_bps,
+                                rx_packets_per_sec: rx_pps,
+                                tx_packets_per_sec: tx_pps,
+                                rx_bytes_total: cur.rx_bytes,
+                                tx_bytes_total: cur.tx_bytes,
+                            });
+                        }
+                    }
+
+                    let snapshot = TrafficSnapshot {
+                        interfaces,
+                        total_rx_bytes_per_sec: total_rx,
+                        total_tx_bytes_per_sec: total_tx,
+                    };
+
+                    let mut state = shared.runtime.write().await;
+                    state.traffic = snapshot;
+                }
+            }
+
+            prev = Some((now, current));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
 // ── Anomaly detection engine ──
 
 async fn process_event(event: KernelEvent, shared: &Shared) {
@@ -1025,6 +1158,7 @@ async fn api_state(State(shared): State<Shared>) -> Json<Snapshot> {
         services: state.service_map.clone(),
         events: state.events.iter().cloned().collect(),
         alerts: state.alerts.iter().cloned().collect(),
+        traffic: state.traffic.clone(),
     };
     Json(snapshot)
 }

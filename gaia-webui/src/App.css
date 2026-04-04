@@ -654,7 +654,21 @@ code {
 }
 
 .row-disabled {
-  opacity: 0.5;
+opacity: 0.5;
+}
+
+/* ── Traffic cells ── */
+
+.traffic-rx {
+  color: #16a34a;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.traffic-tx {
+  color: #2563eb;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }
 
 /* ── Alert list ── */
