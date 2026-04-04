@@ -65,11 +65,17 @@ type RateLimitRule = {
   enabled: boolean
 }
 
+type PatchAction = 'monitor' | 'override_return' | 'skip_call' | 'replace_function'
+
 type HotpatchTarget = {
   binary: string
   symbol: string
   pid?: number | null
   enabled: boolean
+  patch_action: PatchAction
+  override_return_value: number
+  replace_lib?: string | null
+  replace_symbol?: string | null
 }
 
 type MonitorPolicy = {
@@ -858,8 +864,8 @@ function HotpatchTab({ snapshot, lang, tr }: {
     <div className="tab-content">
       <div className="tab-intro">
         <p>{tr(
-          '热补丁代理（主动防御）通过 kprobe/kretprobe 和 uprobe/uretprobe 挂载点，针对高危漏洞函数动态下发补丁。在函数入口校验参数，或通过 bpf_override_return 强制返回错误码，从而在运行时阻断漏洞利用，无需重启服务。',
-          'The Hot-patching Agent (Active Defense) uses kprobe/kretprobe and uprobe/uretprobe hooks to dynamically deploy patches to vulnerable functions. It validates arguments at function entry or forces error returns via bpf_override_return, neutralizing exploits at runtime without service restarts.'
+          '热补丁代理（主动防御）通过 kprobe/kretprobe 和 uprobe/uretprobe 挂载点，针对高危漏洞函数动态下发补丁。支持四种模式：监控出入口、替换返回值、跳过调用、以及函数替换（通过上传 .so 动态链接库，利用 ptrace 注入并写入 trampoline 跳转指令，实现零停机的函数级热修复）。',
+          'The Hot-patching Agent (Active Defense) uses kprobe/kretprobe and uprobe/uretprobe hooks to dynamically deploy patches to vulnerable functions. Four modes: monitor entry/exit, override return value, skip call, and replace function (upload a .so shared library, inject via ptrace and write a trampoline jump — zero-downtime function-level hot-fix).'
         )}</p>
       </div>
 
@@ -1436,7 +1442,25 @@ function RateLimitPanel({ rules, setRules, toggle, flash, tr }: {
   )
 }
 
-const emptyTarget: HotpatchTarget = { binary: '', symbol: '', pid: null, enabled: true }
+const emptyTarget: HotpatchTarget = { binary: '', symbol: '', pid: null, enabled: true, patch_action: 'monitor', override_return_value: 0, replace_lib: null, replace_symbol: null }
+
+const patchActionLabel = (action: PatchAction, tr: (zh: string, en: string) => string) => {
+  switch (action) {
+    case 'monitor': return tr('监控', 'Monitor')
+    case 'override_return': return tr('替换返回值', 'Override Return')
+    case 'skip_call': return tr('跳过调用', 'Skip Call')
+    case 'replace_function': return tr('函数替换', 'Replace Function')
+  }
+}
+
+const patchActionClass = (action: PatchAction) => {
+  switch (action) {
+    case 'monitor': return 'action-log'
+    case 'override_return': return 'action-blocked'
+    case 'skip_call': return 'action-alert'
+    case 'replace_function': return 'action-replace'
+  }
+}
 
 function HotpatchConfigPanel({ targets, setTargets, toggle, flash, tr }: {
   targets: HotpatchTarget[]; setTargets: (t: HotpatchTarget[]) => void
@@ -1445,15 +1469,54 @@ function HotpatchConfigPanel({ targets, setTargets, toggle, flash, tr }: {
 }) {
   const [draft, setDraft] = useState<HotpatchTarget>({ ...emptyTarget })
   const [reloading, setReloading] = useState(false)
+  const [uploading, setUploading] = useState(false)
+  const [uploadedLib, setUploadedLib] = useState<string | null>(null)
   const enabled = targets.filter(t => t.enabled).length
+  const overrides = targets.filter(t => t.enabled && t.patch_action !== 'monitor').length
+
+  const handleUploadLib = async (file: File) => {
+    setUploading(true)
+    try {
+      const form = new FormData()
+      form.append('file', file)
+      const r = await fetch('/api/v1/upload-lib', { method: 'POST', body: form })
+      if (r.ok) {
+        const data = await r.json() as { path: string; size: number; arch: string; name: string }
+        setUploadedLib(data.path)
+        setDraft(d => ({ ...d, replace_lib: data.path }))
+        flash(tr(`库已上传: ${data.name} (${data.arch}, ${data.size} bytes)`, `Library uploaded: ${data.name} (${data.arch}, ${data.size} bytes)`))
+      } else {
+        const text = await r.text()
+        flash(tr('上传失败: ', 'Upload failed: ') + text)
+      }
+    } catch { flash(tr('上传失败: 网络错误', 'Upload failed: network error')) }
+    setUploading(false)
+  }
 
   const handleAdd = async () => {
     if (!draft.binary.trim() || !draft.symbol.trim()) { flash(tr('二进制路径和符号名必填', 'Binary path and symbol name are required')); return }
-    const payload = { binary: draft.binary.trim(), symbol: draft.symbol.trim(), pid: draft.pid || null, enabled: true }
+    if (draft.patch_action === 'replace_function' && !draft.replace_lib) {
+      flash(tr('函数替换模式需要先上传动态链接库', 'Replace function mode requires uploading a shared library first')); return
+    }
+    if (draft.patch_action === 'replace_function' && !draft.pid) {
+      flash(tr('函数替换模式需要指定 PID', 'Replace function mode requires a PID')); return
+    }
+    const payload: Record<string, unknown> = {
+      binary: draft.binary.trim(),
+      symbol: draft.symbol.trim(),
+      pid: draft.pid || null,
+      enabled: true,
+      patch_action: draft.patch_action,
+      override_return_value: draft.override_return_value,
+    }
+    if (draft.patch_action === 'replace_function') {
+      payload.replace_lib = draft.replace_lib
+      payload.replace_symbol = draft.replace_symbol?.trim() || null
+    }
     try {
       const r = await fetch('/api/v1/config/hotpatch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
-      if (r.ok) { setTargets(await r.json()); setDraft({ ...emptyTarget }); flash(tr('热补丁目标已添加', 'Hotpatch target added')) }
-      else flash(tr('添加失败: ', 'Add failed: ') + r.statusText)
+      if (r.ok) { setTargets(await r.json()); setDraft({ ...emptyTarget }); setUploadedLib(null); flash(tr('热补丁目标已添加', 'Hotpatch target added')) }
+      else flash(tr('添加失败: ', 'Add failed: ') + await r.text())
     } catch { flash(tr('添加失败: 网络错误', 'Add failed: network error')) }
   }
 
@@ -1462,6 +1525,18 @@ function HotpatchConfigPanel({ targets, setTargets, toggle, flash, tr }: {
       const r = await fetch(`/api/v1/config/hotpatch/${index}`, { method: 'DELETE' })
       if (r.ok) { setTargets(await r.json()); flash(tr('目标已删除', 'Target removed')) }
     } catch { flash(tr('删除失败', 'Delete failed')) }
+  }
+
+  const handleUpdateTarget = async (index: number, updates: Partial<HotpatchTarget>) => {
+    const target = { ...targets[index], ...updates }
+    try {
+      const r = await fetch('/api/v1/config/hotpatch', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ index, ...target }),
+      })
+      if (r.ok) { setTargets(await r.json()); flash(tr('已更新', 'Updated')) }
+    } catch { flash(tr('更新失败', 'Update failed')) }
   }
 
   const handleReload = async () => {
@@ -1480,33 +1555,71 @@ function HotpatchConfigPanel({ targets, setTargets, toggle, flash, tr }: {
   return (
     <div className="card">
       <div className="card-header">
-        <h3>{tr('热补丁目标配置', 'Hot-Patch Target Configuration')}</h3>
+        <h3>{tr('热补丁 — 运行期函数替换', 'Hot-Patch — Runtime Function Replacement')}</h3>
         <div className="header-actions">
           <button className="btn-reload" onClick={handleReload} disabled={reloading || targets.length === 0}>
             {reloading ? tr('重载中...', 'Reloading...') : tr('重载探针', 'Reload Probes')}
           </button>
           <span className="card-badge">{enabled}/{targets.length} {tr('启用', 'enabled')}</span>
+          {overrides > 0 && <span className="card-badge danger">{overrides} {tr('替换中', 'overriding')}</span>}
         </div>
       </div>
       <p className="card-desc">{tr(
-        '通过 uprobe/uretprobe 在运行时挂载到高危函数。禁用的目标不会被挂载。',
-        'Attach uprobe/uretprobe probes to vulnerable functions at runtime. Disabled targets are not attached.'
+        '通过 uprobe/uretprobe 在运行时挂载到目标函数。支持四种模式：监控（仅记录出入口）、替换返回值（通过 bpf_override_return 强制函数返回指定值）、跳过调用（语义同替换返回值）、函数替换（上传编译好的 .so 动态链接库，通过 ptrace 注入并用 trampoline 替换原函数实现，无需停机重启）。修改补丁动作后需点击"重载探针"生效。',
+        'Attach uprobe/uretprobe to target functions at runtime. Four modes: Monitor (log entry/exit only), Override Return (force return value via bpf_override_return), Skip Call (same mechanism, marked as "skip"), Replace Function (upload a compiled .so, inject via ptrace and replace the original function with a trampoline — zero-downtime). Click "Reload Probes" after changing patch actions.'
       )}</p>
 
       {targets.length > 0 && (
         <div className="toggle-list">
           {targets.map((t, i) => (
-            <div key={i} className={`toggle-row ${t.enabled ? '' : 'disabled'}`}>
+            <div key={i} className={`toggle-row hotpatch-row ${t.enabled ? '' : 'disabled'}`}>
               <button
                 className={`switch ${t.enabled ? 'on' : 'off'}`}
                 onClick={() => toggle('hotpatch_targets', i, !t.enabled)}
               >
                 <span className="switch-knob" />
               </button>
-              <div className="toggle-detail">
-                <code>{t.binary}</code>
-                <span className="toggle-meta">{t.symbol}</span>
-                <span className="toggle-meta">PID: {t.pid ?? tr('全部', 'all')}</span>
+              <div className="toggle-detail hotpatch-detail">
+                <div className="hotpatch-main">
+                  <code>{t.binary}</code>
+                  <span className="toggle-meta">{t.symbol}</span>
+                  <span className="toggle-meta">PID: {t.pid ?? tr('全部', 'all')}</span>
+                </div>
+                <div className="hotpatch-action-row">
+                  <select
+                    className="hotpatch-action-select"
+                    value={t.patch_action}
+                    onChange={e => handleUpdateTarget(i, { patch_action: e.target.value as PatchAction })}
+                    disabled={!t.enabled}
+                  >
+                    <option value="monitor">{tr('监控', 'Monitor')}</option>
+                    <option value="override_return">{tr('替换返回值', 'Override Return')}</option>
+                    <option value="skip_call">{tr('跳过调用', 'Skip Call')}</option>
+                    <option value="replace_function">{tr('函数替换', 'Replace Function')}</option>
+                  </select>
+                  {(t.patch_action === 'override_return' || t.patch_action === 'skip_call') && (
+                    <div className="hotpatch-retval">
+                      <label>{tr('返回值:', 'Return:')}</label>
+                      <input
+                        type="number"
+                        className="hotpatch-retval-input"
+                        value={t.override_return_value}
+                        onChange={e => handleUpdateTarget(i, { override_return_value: parseInt(e.target.value, 10) || 0 })}
+                        disabled={!t.enabled}
+                        title={tr('常用值: 0=成功, -1=EPERM, -13=EACCES, -22=EINVAL', 'Common: 0=success, -1=EPERM, -13=EACCES, -22=EINVAL')}
+                      />
+                    </div>
+                  )}
+                  {t.patch_action === 'replace_function' && t.replace_lib && (
+                    <span className="toggle-meta" title={t.replace_lib}>.so: {t.replace_lib.split('/').pop()}</span>
+                  )}
+                  {t.patch_action === 'replace_function' && t.replace_symbol && (
+                    <span className="toggle-meta">→ {t.replace_symbol}</span>
+                  )}
+                  <span className={`action-tag ${patchActionClass(t.patch_action)}`}>
+                    {patchActionLabel(t.patch_action, tr)}
+                  </span>
+                </div>
               </div>
               <button className="btn-danger-sm" onClick={() => handleDelete(i)}>{tr('删除', 'Delete')}</button>
             </div>
@@ -1520,8 +1633,44 @@ function HotpatchConfigPanel({ targets, setTargets, toggle, flash, tr }: {
           <input type="text" placeholder="/usr/sbin/nginx" value={draft.binary} onChange={e => setDraft({ ...draft, binary: e.target.value })} />
           <input type="text" placeholder="ngx_http_process_request" value={draft.symbol} onChange={e => setDraft({ ...draft, symbol: e.target.value })} />
           <input type="number" min={0} placeholder={tr('PID（可选）', 'PID (optional)')} value={draft.pid ?? ''} onChange={e => setDraft({ ...draft, pid: e.target.value ? parseInt(e.target.value, 10) : null })} />
+          <select value={draft.patch_action} onChange={e => setDraft({ ...draft, patch_action: e.target.value as PatchAction })}>
+            <option value="monitor">{tr('监控', 'Monitor')}</option>
+            <option value="override_return">{tr('替换返回值', 'Override Return')}</option>
+            <option value="skip_call">{tr('跳过调用', 'Skip Call')}</option>
+            <option value="replace_function">{tr('函数替换', 'Replace Function')}</option>
+          </select>
+          {(draft.patch_action === 'override_return' || draft.patch_action === 'skip_call') && (
+            <input type="number" placeholder={tr('返回值 (如 -1)', 'Return value (e.g. -1)')} value={draft.override_return_value} onChange={e => setDraft({ ...draft, override_return_value: parseInt(e.target.value, 10) || 0 })} />
+          )}
           <button className="btn-primary" onClick={handleAdd}>{tr('添加', 'Add')}</button>
         </div>
+        {draft.patch_action === 'replace_function' && (
+          <div className="add-row" style={{ marginTop: 10 }}>
+            <label className="btn-upload" style={{
+              padding: '8px 16px', background: uploadedLib ? '#f0fdf4' : '#f8fafc',
+              border: `1px solid ${uploadedLib ? '#bbf7d0' : '#e2e8f0'}`, borderRadius: 8,
+              fontSize: '12.5px', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 6,
+            }}>
+              {uploading ? tr('上传中...', 'Uploading...') : uploadedLib
+                ? `✅ ${uploadedLib.split('/').pop()}`
+                : tr('📁 上传 .so 动态链接库', '📁 Upload .so Library')}
+              <input
+                type="file"
+                accept=".so,.so.*"
+                style={{ display: 'none' }}
+                onChange={e => { const f = e.target.files?.[0]; if (f) handleUploadLib(f); e.target.value = '' }}
+                disabled={uploading}
+              />
+            </label>
+            <input
+              type="text"
+              placeholder={tr('替换符号名（可选，默认同原符号）', 'Replace symbol (optional, defaults to original)')}
+              value={draft.replace_symbol ?? ''}
+              onChange={e => setDraft({ ...draft, replace_symbol: e.target.value || null })}
+              style={{ minWidth: 240 }}
+            />
+          </div>
+        )}
       </div>
     </div>
   )

@@ -27,6 +27,13 @@ pub const RATE_ACTION_THROTTLE: u8 = 2;
 pub const MAX_RATE_LIMIT_RULES: u32 = 64;
 pub const MAX_RATE_LIMIT_COUNTERS: u32 = 65536;
 pub const MAX_HOTPATCH_PIDS: u32 = 256;
+pub const MAX_HOTPATCH_RULES: u32 = 64;
+
+/// Hotpatch actions: what the uprobe should do when the target function is entered.
+pub const HOTPATCH_ACTION_MONITOR: u8 = 0;
+pub const HOTPATCH_ACTION_OVERRIDE_RETURN: u8 = 1;
+pub const HOTPATCH_ACTION_SKIP_CALL: u8 = 2;
+pub const HOTPATCH_ACTION_REPLACE_FUNCTION: u8 = 3;
 
 /// A CIDR-based rate limit rule stored in BPF HashMap.
 /// Key: rule index (u32). Value: this struct.
@@ -65,6 +72,27 @@ pub struct HotpatchPidEntry {
     /// 1 = active, 0 = inactive
     pub active: u8,
     pub _pad: [u8; 3],
+}
+
+/// Hotpatch rule entry stored in HOTPATCH_RULES BPF HashMap.
+/// Key: rule index (u32). Value: this struct.
+///
+/// Each rule corresponds to one HotpatchTarget and tells the eBPF uprobe
+/// what action to take when the target function is entered.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct HotpatchRuleEntry {
+    /// HOTPATCH_ACTION_MONITOR / HOTPATCH_ACTION_OVERRIDE_RETURN / HOTPATCH_ACTION_SKIP_CALL
+    pub action: u8,
+    /// Whether this rule is enabled (1 = yes, 0 = no)
+    pub enabled: u8,
+    pub _pad: [u8; 2],
+    /// The return value to force when action == OVERRIDE_RETURN or SKIP_CALL.
+    /// Interpreted as a signed i64 (e.g. -1 for EPERM, -22 for EINVAL).
+    pub override_return_value: i64,
+    /// Target PID filter: 0 means match all PIDs.
+    pub target_pid: u32,
+    pub _pad2: [u8; 4],
 }
 
 #[repr(C)]
@@ -113,5 +141,6 @@ mod pod_impls {
     unsafe impl aya::Pod for RateLimitEntry {}
     unsafe impl aya::Pod for RateLimitCounter {}
     unsafe impl aya::Pod for HotpatchPidEntry {}
+    unsafe impl aya::Pod for HotpatchRuleEntry {}
     unsafe impl aya::Pod for KernelEvent {}
 }

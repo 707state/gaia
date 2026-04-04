@@ -10,12 +10,18 @@ use aya_ebpf::{
     maps::{Array, HashMap, RingBuf},
     programs::{ProbeContext, RetProbeContext, TracePointContext},
 };
+// Note: bpf_override_return only works with kprobes on error-injectable kernel
+// functions. It does NOT work with uprobes. For userspace function patching,
+// we use process_vm_writev in the userspace daemon instead.
 use gaia_xdp_common::{
-    HotpatchPidEntry, KernelEvent, RateLimitCounter, RateLimitEntry, EVENT_ACTION_ALERT,
-    EVENT_ACTION_BLOCKED, EVENT_ACTION_ENTER, EVENT_ACTION_EXIT, EVENT_ACTION_RATE_LIMITED,
-    EVENT_KIND_FILE_IO, EVENT_KIND_HOTPATCH, EVENT_KIND_NETWORK, EVENT_KIND_PRIVILEGE,
-    EVENT_KIND_PROCESS, MAX_HOTPATCH_PIDS, MAX_RATE_LIMIT_COUNTERS, MAX_RATE_LIMIT_RULES,
-    PROTOCOL_TCP, RATE_ACTION_BLOCK,
+    HotpatchPidEntry, HotpatchRuleEntry, KernelEvent, RateLimitCounter, RateLimitEntry,
+    EVENT_ACTION_ALERT, EVENT_ACTION_BLOCKED, EVENT_ACTION_ENTER, EVENT_ACTION_EXIT,
+    EVENT_ACTION_RATE_LIMITED, EVENT_KIND_FILE_IO, EVENT_KIND_HOTPATCH, EVENT_KIND_NETWORK,
+    EVENT_KIND_PRIVILEGE, EVENT_KIND_PROCESS, HOTPATCH_ACTION_MONITOR,
+    HOTPATCH_ACTION_OVERRIDE_RETURN, HOTPATCH_ACTION_REPLACE_FUNCTION,
+    HOTPATCH_ACTION_SKIP_CALL, MAX_HOTPATCH_PIDS,
+    MAX_HOTPATCH_RULES, MAX_RATE_LIMIT_COUNTERS, MAX_RATE_LIMIT_RULES, PROTOCOL_TCP,
+    RATE_ACTION_BLOCK,
 };
 
 // ── Tracepoint field offsets ──
@@ -85,6 +91,17 @@ static RATE_LIMIT_COUNTERS: HashMap<u32, RateLimitCounter> =
 #[map]
 static HOTPATCH_PIDS: HashMap<u32, HotpatchPidEntry> =
     HashMap::with_max_entries(MAX_HOTPATCH_PIDS, 0);
+
+/// Hotpatch rules: key = rule index (u32), value = HotpatchRuleEntry.
+/// Each rule corresponds to one configured HotpatchTarget and defines
+/// the action (monitor / override_return / skip_call) and return value.
+#[map]
+static HOTPATCH_RULES: HashMap<u32, HotpatchRuleEntry> =
+    HashMap::with_max_entries(MAX_HOTPATCH_RULES, 0);
+
+/// Number of active hotpatch rules (stored at index 0).
+#[map]
+static HOTPATCH_RULE_COUNT: Array<u32> = Array::with_max_entries(1, 0);
 
 // ── helpers ──
 
@@ -408,20 +425,105 @@ pub fn kprobe_hotpatch_guard(ctx: ProbeContext) -> u32 {
     0
 }
 
+/// Look up the first matching hotpatch rule for the current PID.
+/// Returns the rule if found and enabled.
+#[inline(always)]
+fn find_hotpatch_rule(pid: u32) -> Option<HotpatchRuleEntry> {
+    let count_ptr = HOTPATCH_RULE_COUNT.get_ptr(0)?;
+    let rule_count = unsafe { *count_ptr };
+    if rule_count == 0 {
+        return None;
+    }
+    let max = if rule_count > 32 { 32 } else { rule_count };
+    let mut idx: u32 = 0;
+    while idx < max {
+        if let Some(rule) = unsafe { HOTPATCH_RULES.get(&idx) } {
+            if rule.enabled != 0 {
+                // target_pid == 0 means match all PIDs
+                if rule.target_pid == 0 || rule.target_pid == pid {
+                    return Some(*rule);
+                }
+            }
+        }
+        idx += 1;
+    }
+    None
+}
+
 #[uprobe]
 pub fn uprobe_hotpatch_entry(_ctx: ProbeContext) -> u32 {
     let Some(ptr) = get_scratch() else { return 0 };
     let event = unsafe { &mut *ptr };
     fill_base(event, EVENT_KIND_HOTPATCH, EVENT_ACTION_ENTER);
 
-    // Check if this PID is in the hotpatch filter
     let pid = bpf_get_current_pid_tgid() as u32;
+
+    // Legacy PID filter check (backward compat)
     if let Some(entry) = unsafe { HOTPATCH_PIDS.get(&pid) } {
         if entry.active != 0 {
-            copy_bytes(&mut event.detail, b"uprobe-entry:filtered");
+            copy_bytes(&mut event.detail, b"uprobe-entry:pid-filtered");
             event.action = EVENT_ACTION_BLOCKED;
             emit(event);
             return 0;
+        }
+    }
+
+    // Check hotpatch rules and log the action.
+    // NOTE: Actual function replacement (override_return / skip_call) is performed
+    // by the userspace daemon via process_vm_writev, NOT by bpf_override_return
+    // (which only works with kprobes, not uprobes). The eBPF uprobe here serves
+    // as a monitoring/auditing layer.
+    if let Some(rule) = find_hotpatch_rule(pid) {
+        match rule.action {
+            HOTPATCH_ACTION_OVERRIDE_RETURN => {
+                // Log that this function entry was observed under an override_return rule.
+                copy_bytes(&mut event.detail, b"uprobe:override_return=");
+                let prefix_len = 22;
+                let mut buf = [0u8; 20];
+                let val = rule.override_return_value;
+                let n = if val < 0 {
+                    event.detail[prefix_len] = b'-';
+                    let abs_n = u64_to_ascii(val.unsigned_abs(), &mut buf);
+                    let mut j = 0;
+                    while j < abs_n && (prefix_len + 1 + j) < event.detail.len() {
+                        event.detail[prefix_len + 1 + j] = buf[j];
+                        j += 1;
+                    }
+                    abs_n + 1
+                } else {
+                    let abs_n = u64_to_ascii(val as u64, &mut buf);
+                    let mut j = 0;
+                    while j < abs_n && (prefix_len + j) < event.detail.len() {
+                        event.detail[prefix_len + j] = buf[j];
+                        j += 1;
+                    }
+                    abs_n
+                };
+                let _ = n;
+                event.action = EVENT_ACTION_BLOCKED;
+                emit(event);
+                return 0;
+            }
+            HOTPATCH_ACTION_SKIP_CALL => {
+                copy_bytes(&mut event.detail, b"uprobe:skip_call");
+                event.action = EVENT_ACTION_BLOCKED;
+                emit(event);
+                return 0;
+            }
+            HOTPATCH_ACTION_REPLACE_FUNCTION => {
+                // The actual function replacement is done by the userspace daemon
+                // via dlopen injection + trampoline. The uprobe here just monitors
+                // that the trampoline is being hit (the original entry point).
+                copy_bytes(&mut event.detail, b"uprobe:replace_function");
+                event.action = EVENT_ACTION_BLOCKED;
+                emit(event);
+                return 0;
+            }
+            HOTPATCH_ACTION_MONITOR | _ => {
+                copy_bytes(&mut event.detail, b"uprobe-entry:monitored");
+                emit(event);
+                return 0;
+            }
         }
     }
 
@@ -431,21 +533,34 @@ pub fn uprobe_hotpatch_entry(_ctx: ProbeContext) -> u32 {
 }
 
 #[uretprobe]
-pub fn uretprobe_hotpatch_exit(_ctx: RetProbeContext) -> u32 {
+pub fn uretprobe_hotpatch_exit(ctx: RetProbeContext) -> u32 {
     let Some(ptr) = get_scratch() else { return 0 };
     let event = unsafe { &mut *ptr };
     fill_base(event, EVENT_KIND_HOTPATCH, EVENT_ACTION_EXIT);
 
     let pid = bpf_get_current_pid_tgid() as u32;
+
+    // Legacy PID filter
     if let Some(entry) = unsafe { HOTPATCH_PIDS.get(&pid) } {
         if entry.active != 0 {
-            copy_bytes(&mut event.detail, b"uretprobe-exit:filtered");
+            copy_bytes(&mut event.detail, b"uretprobe-exit:pid-filtered");
             emit(event);
             return 0;
         }
     }
 
-    copy_bytes(&mut event.detail, b"uretprobe-exit");
+    // Log the actual return value for monitoring/auditing
+    let retval: u64 = ctx.ret();
+    copy_bytes(&mut event.detail, b"uretprobe-exit:ret=");
+    let prefix_len = 19;
+    let mut buf = [0u8; 20];
+    let n = u64_to_ascii(retval, &mut buf);
+    let mut j = 0;
+    while j < n && (prefix_len + j) < event.detail.len() {
+        event.detail[prefix_len + j] = buf[j];
+        j += 1;
+    }
+
     emit(event);
     0
 }

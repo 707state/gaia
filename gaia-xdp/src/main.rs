@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Multipart, State},
     http::{HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -25,7 +25,9 @@ use clap::Parser;
 use gaia_xdp_common::{
     EVENT_ACTION_ALERT, EVENT_ACTION_BLOCKED, EVENT_ACTION_RATE_LIMITED,
     EVENT_KIND_FILE_IO, EVENT_KIND_HOTPATCH, EVENT_KIND_NETWORK, EVENT_KIND_PRIVILEGE,
-    EVENT_KIND_PROCESS, HotpatchPidEntry, KernelEvent, RateLimitEntry,
+    EVENT_KIND_PROCESS, HOTPATCH_ACTION_MONITOR, HOTPATCH_ACTION_OVERRIDE_RETURN,
+    HOTPATCH_ACTION_REPLACE_FUNCTION, HOTPATCH_ACTION_SKIP_CALL,
+    HotpatchPidEntry, HotpatchRuleEntry, KernelEvent, RateLimitEntry,
 };
 use log::{info, warn};
 use object::{Object, ObjectSymbol};
@@ -114,6 +116,39 @@ struct HotpatchTarget {
     pid: Option<u32>,
     #[serde(default = "default_true")]
     enabled: bool,
+    /// What the uprobe should do: "monitor", "override_return", "skip_call", or "replace_function".
+    #[serde(default = "default_patch_action")]
+    patch_action: PatchAction,
+    /// The return value to force when patch_action is override_return or skip_call.
+    /// Interpreted as a signed i64 (e.g. -1 for -EPERM, -22 for -EINVAL, 0 for success).
+    #[serde(default)]
+    override_return_value: i64,
+    /// Path to the replacement shared library (.so) for replace_function.
+    /// The .so must export a function with the same signature as the original.
+    #[serde(default)]
+    replace_lib: Option<String>,
+    /// Symbol name in the replacement .so to use. Defaults to the same as `symbol` if omitted.
+    #[serde(default)]
+    replace_symbol: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum PatchAction {
+    /// Just observe function entry/exit, don't interfere.
+    #[default]
+    Monitor,
+    /// Force the function to return a specific value immediately (skip function body).
+    OverrideReturn,
+    /// Skip the function call entirely (semantic alias for override_return).
+    SkipCall,
+    /// Replace the function implementation with one from a shared library.
+    /// Requires `replace_lib` to be set on the target.
+    ReplaceFunction,
+}
+
+fn default_patch_action() -> PatchAction {
+    PatchAction::Monitor
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -282,6 +317,8 @@ struct Shared {
     bpf: Arc<Mutex<Ebpf>>,
     hotpatch_active: Arc<Mutex<bool>>,
     symbol_resolver_ok: Arc<Mutex<bool>>,
+    /// Tracks code patches applied via process_vm_writev so they can be restored.
+    code_patches: Arc<Mutex<Vec<PatchedFunction>>>,
 }
 
 // ── main ──
@@ -311,6 +348,7 @@ async fn main() -> Result<()> {
         bpf: Arc::new(Mutex::new(bpf)),
         hotpatch_active: Arc::new(Mutex::new(false)),
         symbol_resolver_ok: Arc::new(Mutex::new(true)),
+        code_patches: Arc::new(Mutex::new(Vec::new())),
     };
 
     // The kprobe guard was already attached in attach_agents(), so the
@@ -333,7 +371,21 @@ async fn main() -> Result<()> {
             }
             Err(err) => warn!("hot-patch uprobe attach skipped: {err:#}"),
         }
+    }
 
+    // Sync hotpatch rules to BPF maps (must happen after bpf_guard is dropped above)
+    sync_bpf_hotpatch_pids(&shared, &policy.hotpatch.targets);
+    sync_bpf_hotpatch_rules(&shared, &policy.hotpatch.targets);
+
+    // Apply runtime code patches for override_return / skip_call targets.
+    // This uses process_vm_writev to directly modify the target function's code.
+    {
+        let mut patches = shared.code_patches.lock().unwrap();
+        apply_hotpatch_code_patches(&policy.hotpatch.targets, &mut patches);
+    }
+
+    {
+        let mut bpf_guard = shared.bpf.lock().unwrap();
         let events = bpf_guard.take_map("EVENTS").context("missing EVENTS map")?;
         let events = RingBuf::<MapData>::try_from(events).context("open EVENTS ring buffer")?;
         spawn_event_collector(events, shared.clone());
@@ -552,6 +604,87 @@ fn sync_bpf_hotpatch_pids(shared: &Shared, targets: &[HotpatchTarget]) {
     }
 }
 
+/// Sync hotpatch rules to the HOTPATCH_RULES BPF map.
+/// Each enabled target with a non-monitor patch_action gets a rule entry
+/// that the eBPF uprobe reads to decide whether to override the function return.
+fn sync_bpf_hotpatch_rules(shared: &Shared, targets: &[HotpatchTarget]) {
+    if let Ok(mut bpf) = shared.bpf.lock() {
+        // Update rule count
+        {
+            let map = match bpf.map_mut("HOTPATCH_RULE_COUNT") {
+                Some(m) => m,
+                None => {
+                    warn!("missing HOTPATCH_RULE_COUNT map");
+                    return;
+                }
+            };
+            let mut arr = match BpfArray::<_, u32>::try_from(map) {
+                Ok(a) => a,
+                Err(err) => {
+                    warn!("HOTPATCH_RULE_COUNT cast failed: {err:#}");
+                    return;
+                }
+            };
+            let count = targets.iter().filter(|t| t.enabled).count() as u32;
+            let _ = arr.set(0, count, 0);
+        }
+
+        // Update rules map
+        {
+            let map = match bpf.map_mut("HOTPATCH_RULES") {
+                Some(m) => m,
+                None => {
+                    warn!("missing HOTPATCH_RULES map");
+                    return;
+                }
+            };
+            let mut rule_map =
+                match BpfHashMap::<_, u32, HotpatchRuleEntry>::try_from(map) {
+                    Ok(m) => m,
+                    Err(err) => {
+                        warn!("HOTPATCH_RULES cast failed: {err:#}");
+                        return;
+                    }
+                };
+            // Clear existing
+            let existing: Vec<u32> = rule_map.keys().filter_map(|k| k.ok()).collect();
+            for k in existing {
+                let _ = rule_map.remove(&k);
+            }
+            // Insert rules for enabled targets
+            let mut idx: u32 = 0;
+            for target in targets {
+                let action = match target.patch_action {
+                    PatchAction::Monitor => HOTPATCH_ACTION_MONITOR,
+                    PatchAction::OverrideReturn => HOTPATCH_ACTION_OVERRIDE_RETURN,
+                    PatchAction::SkipCall => HOTPATCH_ACTION_SKIP_CALL,
+                    PatchAction::ReplaceFunction => HOTPATCH_ACTION_REPLACE_FUNCTION,
+                };
+                let entry = HotpatchRuleEntry {
+                    action,
+                    enabled: if target.enabled { 1 } else { 0 },
+                    _pad: [0; 2],
+                    override_return_value: target.override_return_value,
+                    target_pid: target.pid.unwrap_or(0),
+                    _pad2: [0; 4],
+                };
+                let _ = rule_map.insert(idx, entry, 0);
+                idx += 1;
+            }
+        }
+
+        let active_overrides = targets
+            .iter()
+            .filter(|t| t.enabled && t.patch_action != PatchAction::Monitor)
+            .count();
+        info!(
+            "hotpatch rules synced: {} total, {} active override/skip rules",
+            targets.len(),
+            active_overrides
+        );
+    }
+}
+
 fn attach_hotpatch_targets(
     bpf: &mut Ebpf,
     targets: &[HotpatchTarget],
@@ -654,6 +787,979 @@ fn attach_hotpatch_targets(
     }
 
     Ok(())
+}
+
+// ── Runtime code patching via process_vm_writev ──
+//
+// bpf_override_return only works with kprobes on error-injectable kernel functions.
+// For userspace function patching, we directly modify the target function's machine
+// code using process_vm_writev. On aarch64, we replace the first two instructions
+// with: `mov x0, #value; ret` (or `movn x0, #~value; ret` for negative values).
+// The original instructions are saved so they can be restored later.
+
+/// Saved original instructions for a patched function, keyed by (pid, address).
+#[derive(Debug, Clone)]
+struct PatchedFunction {
+    pid: u32,
+    address: u64,
+    /// Original bytes at the patch site. Length depends on patch type:
+    /// - override_return/skip_call: 8 bytes (2 aarch64 instructions)
+    /// - replace_function: 16 bytes (4 aarch64 instructions for trampoline)
+    original_bytes: Vec<u8>,
+}
+
+/// Apply runtime code patches for hotpatch targets that use override_return, skip_call,
+/// or replace_function. This modifies the target process's function code in-place using
+/// ptrace POKETEXT, which can write to read-only .text segment pages.
+///
+/// A PID must be explicitly specified in the target configuration. Targets without
+/// a PID are skipped with a warning (hotpatching is only supported for long-running
+/// processes like databases or systemd services).
+fn apply_hotpatch_code_patches(
+    targets: &[HotpatchTarget],
+    patches: &mut Vec<PatchedFunction>,
+) {
+    for target in targets {
+        if !target.enabled {
+            continue;
+        }
+        if target.patch_action == PatchAction::Monitor {
+            continue;
+        }
+
+        let Some(pid) = target.pid else {
+            warn!(
+                "hotpatch target {}:{} has no PID — skipping (hotpatch requires an explicit PID for long-running processes)",
+                target.binary, target.symbol
+            );
+            continue;
+        };
+
+        let binary_path = Path::new(&target.binary);
+        if !binary_path.exists() {
+            warn!("hotpatch binary not found: {} — skipping patch", target.binary);
+            continue;
+        }
+
+        if target.patch_action == PatchAction::ReplaceFunction {
+            apply_replace_function_patch(pid, target, binary_path, patches);
+        } else {
+            let patch_bytes = generate_patch_instructions(target.override_return_value);
+            apply_single_code_patch(pid, target, binary_path, &patch_bytes, patches);
+        }
+    }
+}
+
+/// Apply a code patch to a single (pid, target) pair.
+fn apply_single_code_patch(
+    pid: u32,
+    target: &HotpatchTarget,
+    binary_path: &Path,
+    patch_bytes: &[u8; 8],
+    patches: &mut Vec<PatchedFunction>,
+) {
+    // Resolve the runtime address of the target function
+    let func_addr = match resolve_runtime_symbol(pid, binary_path, &target.symbol) {
+        Ok(addr) => addr,
+        Err(err) => {
+            warn!(
+                "cannot resolve {}:{} pid={} for code patch: {err:#}",
+                target.binary, target.symbol, pid
+            );
+            return;
+        }
+    };
+
+    // Check if already patched at this address
+    if patches.iter().any(|p| p.pid == pid && p.address == func_addr) {
+        info!(
+            "hotpatch already applied at {}:{} pid={} addr=0x{:x}",
+            target.binary, target.symbol, pid, func_addr
+        );
+        return;
+    }
+
+    // Read original instructions and write patch in a single ptrace session
+    let result = ptrace_read_and_write(pid, func_addr, patch_bytes);
+    match result {
+        Ok(original_bytes) => {
+            patches.push(PatchedFunction {
+                pid,
+                address: func_addr,
+                original_bytes,
+            });
+            info!(
+                "hotpatch code patch applied: {}:{} pid={} addr=0x{:x} override_return_value={}",
+                target.binary, target.symbol, pid, func_addr, target.override_return_value
+            );
+        }
+        Err(err) => {
+            warn!(
+                "failed to apply code patch at {}:{} pid={} addr=0x{:x}: {err:#}",
+                target.binary, target.symbol, pid, func_addr
+            );
+        }
+    }
+}
+
+// ── Live function replacement via dlopen injection + trampoline ──
+//
+// To replace a function in a running process with a new implementation from a .so:
+//
+// 1. Inject the .so into the target process by calling __libc_dlopen_mode() via ptrace.
+//    We use the internal glibc symbol because the target may not link libdl.
+//    The injection writes a small shellcode snippet into the process's stack, sets
+//    PC to it, single-steps, then restores everything.
+//
+// 2. Resolve the replacement function's address in the target process by parsing
+//    /proc/<pid>/maps to find where the .so was loaded, then adding the symbol offset.
+//
+// 3. Write a trampoline at the original function's entry point that jumps to the
+//    replacement function. On aarch64 this is 4 instructions (16 bytes):
+//      movz x16, #<addr_bits_0_15>
+//      movk x16, #<addr_bits_16_31>, lsl #16
+//      movk x16, #<addr_bits_32_47>, lsl #32
+//      movk x16, #<addr_bits_48_63>, lsl #48  (usually 0 for userspace)
+//    followed by: br x16
+//    But since userspace addresses on aarch64 Linux fit in 48 bits, we can use
+//    3 movz/movk + br = 4 instructions = 16 bytes.
+
+/// Generate an aarch64 trampoline that jumps to an absolute 64-bit address.
+/// Uses x16 (IP0) as the scratch register, which is the standard intra-procedure-call
+/// scratch register on aarch64 and is caller-saved.
+///
+/// Produces 4 instructions (16 bytes):
+///   movz x16, #<bits 0..15>
+///   movk x16, #<bits 16..31>, lsl #16
+///   movk x16, #<bits 32..47>, lsl #32
+///   br   x16
+#[cfg(target_arch = "aarch64")]
+fn generate_trampoline(target_addr: u64) -> [u8; 16] {
+    let mut buf = [0u8; 16];
+    let imm0 = (target_addr & 0xFFFF) as u32;
+    let imm1 = ((target_addr >> 16) & 0xFFFF) as u32;
+    let imm2 = ((target_addr >> 32) & 0xFFFF) as u32;
+
+    // movz x16, #imm0          — 0xD2800010 | (imm0 << 5)
+    let insn0 = 0xD280_0010u32 | (imm0 << 5);
+    // movk x16, #imm1, lsl #16 — 0xF2A00010 | (imm1 << 5)
+    let insn1 = 0xF2A0_0010u32 | (imm1 << 5);
+    // movk x16, #imm2, lsl #32 — 0xF2C00010 | (imm2 << 5)
+    let insn2 = 0xF2C0_0010u32 | (imm2 << 5);
+    // br x16                   — 0xD61F0200
+    let insn3 = 0xD61F_0200u32;
+
+    buf[0..4].copy_from_slice(&insn0.to_le_bytes());
+    buf[4..8].copy_from_slice(&insn1.to_le_bytes());
+    buf[8..12].copy_from_slice(&insn2.to_le_bytes());
+    buf[12..16].copy_from_slice(&insn3.to_le_bytes());
+    buf
+}
+
+#[cfg(target_arch = "x86_64")]
+fn generate_trampoline(target_addr: u64) -> [u8; 16] {
+    // x86_64: movabs rax, <addr>; jmp rax; padding
+    // movabs rax = 48 B8 <8 bytes>  (10 bytes)
+    // jmp rax    = FF E0             (2 bytes)
+    // nop * 4                        (4 bytes padding to 16)
+    let mut buf = [0x90u8; 16]; // NOP fill
+    buf[0] = 0x48;
+    buf[1] = 0xB8;
+    buf[2..10].copy_from_slice(&target_addr.to_le_bytes());
+    buf[10] = 0xFF;
+    buf[11] = 0xE0;
+    buf
+}
+
+/// Inject a shared library into a target process using ptrace.
+///
+/// This works by:
+/// 1. Attaching to the process via ptrace
+/// 2. Saving the current registers
+/// 3. Finding __libc_dlopen_mode in the target's libc
+/// 4. Writing the .so path string to the process's stack
+/// 5. Setting up a call to __libc_dlopen_mode(path, RTLD_NOW)
+/// 6. Single-stepping through the call
+/// 7. Restoring original registers and detaching
+///
+/// Returns Ok(()) if the library was successfully loaded.
+#[cfg(target_arch = "aarch64")]
+fn inject_shared_library(pid: u32, lib_path: &Path) -> Result<()> {
+    let pid_t = pid as libc::pid_t;
+    let lib_path_str = lib_path
+        .canonicalize()
+        .unwrap_or_else(|_| lib_path.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    let lib_path_bytes = lib_path_str.as_bytes();
+
+    // Check if already loaded
+    let maps = fs::read_to_string(format!("/proc/{pid}/maps"))
+        .context("read /proc/pid/maps")?;
+    if maps.contains(&lib_path_str) {
+        info!("library {} already loaded in pid={}", lib_path_str, pid);
+        return Ok(());
+    }
+
+    // Find __libc_dlopen_mode address in the target process.
+    // We resolve it by finding libc's base in the target, then adding the offset
+    // of __libc_dlopen_mode from our own libc (assuming same libc version).
+    let dlopen_addr = resolve_libc_dlopen_in_target(pid)?;
+    info!(
+        "resolved __libc_dlopen_mode in pid={} at 0x{:x}",
+        pid, dlopen_addr
+    );
+
+    // Attach
+    let ret = unsafe { libc::ptrace(libc::PTRACE_ATTACH, pid_t, 0, 0) };
+    if ret < 0 {
+        return Err(anyhow!(
+            "ptrace ATTACH failed for pid={}: {}",
+            pid,
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut status: libc::c_int = 0;
+    unsafe { libc::waitpid(pid_t, &mut status, 0) };
+
+    // Save original registers
+    let mut orig_regs = [0u64; 34]; // aarch64: x0-x30, sp, pc, pstate
+    let mut iov = libc::iovec {
+        iov_base: orig_regs.as_mut_ptr() as *mut libc::c_void,
+        iov_len: std::mem::size_of_val(&orig_regs),
+    };
+    let ret = unsafe {
+        libc::ptrace(
+            libc::PTRACE_GETREGSET,
+            pid_t,
+            1 as *mut libc::c_void,
+            &mut iov as *mut _ as *mut libc::c_void,
+        )
+    };
+    if ret < 0 {
+        unsafe { libc::ptrace(libc::PTRACE_DETACH, pid_t, 0, 0) };
+        return Err(anyhow!(
+            "GETREGSET failed for pid={}: {}",
+            pid,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // Write the library path string onto the stack (below current SP).
+    // We need the path to be null-terminated and 8-byte aligned.
+    let path_with_nul_len = lib_path_bytes.len() + 1;
+    let aligned_len = (path_with_nul_len + 7) & !7;
+    let mut path_buf = vec![0u8; aligned_len];
+    path_buf[..lib_path_bytes.len()].copy_from_slice(lib_path_bytes);
+
+    let sp = orig_regs[31]; // SP
+    // Reserve space below SP for the path string + 16 bytes of stack alignment padding
+    let string_addr = (sp - aligned_len as u64 - 16) & !0xF;
+
+    // Write path string via POKETEXT
+    let word_size = std::mem::size_of::<libc::c_long>();
+    for i in (0..aligned_len).step_by(word_size) {
+        let word = libc::c_long::from_ne_bytes(
+            path_buf[i..i + word_size].try_into().unwrap(),
+        );
+        let ret = unsafe {
+            libc::ptrace(
+                libc::PTRACE_POKETEXT,
+                pid_t,
+                (string_addr + i as u64) as *mut libc::c_void,
+                word as *mut libc::c_void,
+            )
+        };
+        if ret < 0 {
+            unsafe { libc::ptrace(libc::PTRACE_DETACH, pid_t, 0, 0) };
+            return Err(anyhow!(
+                "POKETEXT (path string) failed at offset {}: {}",
+                i,
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+
+    // Strategy: No shellcode needed. We set PC directly to __libc_dlopen_mode
+    // and LR to 0 (an unmapped address). When dlopen returns, RET jumps to 0
+    // which triggers SIGSEGV. We catch that, read x0 (the return value), then
+    // restore registers and detach.
+    //
+    // This avoids the NX-stack problem entirely since we never execute code
+    // from the stack.
+    let new_sp = string_addr & !0xF; // 16-byte aligned, below the string
+    let mut call_regs = orig_regs;
+    call_regs[0] = string_addr;       // x0 = path to .so
+    call_regs[1] = 0x2;               // x1 = RTLD_NOW
+    call_regs[30] = 0;                // LR = 0 (will SIGSEGV on return)
+    call_regs[31] = new_sp;           // SP (16-byte aligned)
+    call_regs[32] = dlopen_addr;      // PC = __libc_dlopen_mode
+
+    iov.iov_len = std::mem::size_of_val(&call_regs);
+    iov.iov_base = call_regs.as_mut_ptr() as *mut libc::c_void;
+    let ret = unsafe {
+        libc::ptrace(
+            libc::PTRACE_SETREGSET,
+            pid_t,
+            1 as *mut libc::c_void,
+            &iov as *const _ as *mut libc::c_void,
+        )
+    };
+    if ret < 0 {
+        unsafe { libc::ptrace(libc::PTRACE_DETACH, pid_t, 0, 0) };
+        return Err(anyhow!(
+            "SETREGSET failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // Continue execution — dlopen will run, then RET to address 0 → SIGSEGV
+    let ret = unsafe { libc::ptrace(libc::PTRACE_CONT, pid_t, 0, 0) };
+    if ret < 0 {
+        unsafe { libc::ptrace(libc::PTRACE_DETACH, pid_t, 0, 0) };
+        return Err(anyhow!(
+            "PTRACE_CONT failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // Wait for the trap signal (SIGSEGV from RET to address 0)
+    let mut status: libc::c_int = 0;
+    let ret = unsafe { libc::waitpid(pid_t, &mut status, 0) };
+    if ret < 0 {
+        unsafe { libc::ptrace(libc::PTRACE_DETACH, pid_t, 0, 0) };
+        return Err(anyhow!(
+            "waitpid after dlopen call failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // Verify we got a signal stop (SIGSEGV or SIGTRAP)
+    if libc::WIFSTOPPED(status) {
+        let sig = libc::WSTOPSIG(status);
+        if sig != libc::SIGSEGV && sig != libc::SIGTRAP {
+            warn!(
+                "inject_shared_library: unexpected stop signal {} in pid={}",
+                sig, pid
+            );
+        }
+    } else if libc::WIFSIGNALED(status) {
+        unsafe { libc::ptrace(libc::PTRACE_DETACH, pid_t, 0, 0) };
+        return Err(anyhow!(
+            "target pid={} was killed by signal {} during dlopen injection",
+            pid,
+            libc::WTERMSIG(status)
+        ));
+    }
+
+    // Read x0 to check dlopen return value (should be non-null handle)
+    let mut result_regs = [0u64; 34];
+    iov.iov_base = result_regs.as_mut_ptr() as *mut libc::c_void;
+    iov.iov_len = std::mem::size_of_val(&result_regs);
+    unsafe {
+        libc::ptrace(
+            libc::PTRACE_GETREGSET,
+            pid_t,
+            1 as *mut libc::c_void,
+            &mut iov as *mut _ as *mut libc::c_void,
+        )
+    };
+    let dlopen_result = result_regs[0];
+    let pc_after = result_regs[32];
+
+    info!(
+        "inject_shared_library: after dlopen call, x0=0x{:x}, pc=0x{:x}, status=0x{:x}",
+        dlopen_result, pc_after, status
+    );
+
+    // Restore original registers (this also restores PC to where the process was)
+    iov.iov_base = orig_regs.as_mut_ptr() as *mut libc::c_void;
+    iov.iov_len = std::mem::size_of_val(&orig_regs);
+    unsafe {
+        libc::ptrace(
+            libc::PTRACE_SETREGSET,
+            pid_t,
+            1 as *mut libc::c_void,
+            &iov as *const _ as *mut libc::c_void,
+        )
+    };
+
+    // Detach (delivers no signal, process resumes normally from original PC)
+    unsafe { libc::ptrace(libc::PTRACE_DETACH, pid_t, 0, 0) };
+
+    // Verify: PC should be 0 (our trap address) if dlopen completed successfully
+    if pc_after != 0 {
+        warn!(
+            "inject_shared_library: PC after dlopen is 0x{:x} (expected 0x0) — dlopen may not have completed",
+            pc_after
+        );
+    }
+
+    if dlopen_result == 0 {
+        return Err(anyhow!(
+            "dlopen failed in pid={} for library {} (returned NULL)",
+            pid,
+            lib_path_str
+        ));
+    }
+
+    info!(
+        "library {} injected into pid={} (handle=0x{:x})",
+        lib_path_str, pid, dlopen_result
+    );
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn inject_shared_library(pid: u32, lib_path: &Path) -> Result<()> {
+    // x86_64 implementation uses the same strategy but with different register layout.
+    // For now, delegate to a simpler approach: we just need the .so to be loadable.
+    let _ = (pid, lib_path);
+    Err(anyhow!("inject_shared_library not yet implemented for x86_64"))
+}
+
+/// Resolve the address of __libc_dlopen_mode in the target process.
+///
+/// Strategy: find libc's base address in the target's /proc/pid/maps,
+/// then find the symbol offset from the libc .so file on disk.
+fn resolve_libc_dlopen_in_target(pid: u32) -> Result<u64> {
+    let maps = fs::read_to_string(format!("/proc/{pid}/maps"))
+        .context("read /proc/pid/maps")?;
+
+    // Find the first executable mapping of libc
+    let mut libc_base: Option<u64> = None;
+    let mut libc_path: Option<String> = None;
+    for line in maps.lines() {
+        // Look for libc.so or libc-*.so
+        if (line.contains("libc.so") || line.contains("libc-")) && line.contains("r-xp") {
+            let mut fields = line.split_whitespace();
+            if let Some(range) = fields.next() {
+                if let Some((start_str, _)) = range.split_once('-') {
+                    libc_base = u64::from_str_radix(start_str, 16).ok();
+                }
+            }
+            // The path is the last field
+            libc_path = line.split_whitespace().last().map(|s| s.to_string());
+            break;
+        }
+    }
+
+    let base = libc_base.ok_or_else(|| anyhow!("cannot find libc mapping in pid={}", pid))?;
+    let path = libc_path.ok_or_else(|| anyhow!("cannot find libc path in pid={}", pid))?;
+
+    // Resolve __libc_dlopen_mode offset from the libc binary
+    let offset = resolve_symbol_offset(Path::new(&path), "__libc_dlopen_mode")
+        .or_else(|_| resolve_symbol_offset(Path::new(&path), "dlopen"))
+        .context("cannot find dlopen symbol in libc")?;
+
+    Ok(base + offset)
+}
+
+/// Resolve the runtime address of a symbol in an injected .so within the target process.
+/// Parses /proc/<pid>/maps to find the .so's load base, then adds the symbol offset.
+fn resolve_injected_symbol(pid: u32, lib_path: &Path, symbol: &str) -> Result<u64> {
+    let canonical = lib_path
+        .canonicalize()
+        .unwrap_or_else(|_| lib_path.to_path_buf());
+    let canonical_str = canonical.to_string_lossy();
+    // Also extract just the filename for fallback matching
+    let filename = lib_path
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let maps = fs::read_to_string(format!("/proc/{pid}/maps"))
+        .context("read /proc/pid/maps")?;
+
+    // Strategy: collect all mappings that match the library, prefer r-xp but accept any.
+    // Match by canonical path first, then fall back to filename.
+    let mut best_base: Option<(u64, bool)> = None; // (addr, is_executable)
+    for line in maps.lines() {
+        // Check if this line references our library (by full path or filename)
+        let path_field = line.split_whitespace().last().unwrap_or("");
+        let matches = path_field.contains(canonical_str.as_ref())
+            || (!filename.is_empty() && path_field.ends_with(&filename));
+        if !matches {
+            continue;
+        }
+
+        let is_exec = line.contains("r-xp");
+        let mut fields = line.split_whitespace();
+        if let Some(range) = fields.next() {
+            if let Some((start_str, _)) = range.split_once('-') {
+                if let Ok(addr) = u64::from_str_radix(start_str, 16) {
+                    match best_base {
+                        None => best_base = Some((addr, is_exec)),
+                        Some((_, false)) if is_exec => best_base = Some((addr, is_exec)),
+                        _ => {} // keep existing r-xp match or first match
+                    }
+                    if is_exec {
+                        break; // r-xp is ideal, stop searching
+                    }
+                }
+            }
+        }
+    }
+
+    let base = best_base
+        .map(|(addr, _)| addr)
+        .ok_or_else(|| {
+            // Dump maps lines containing the filename for debugging
+            let relevant: Vec<&str> = maps
+                .lines()
+                .filter(|l| {
+                    l.contains(canonical_str.as_ref())
+                        || (!filename.is_empty() && l.contains(&filename))
+                })
+                .collect();
+            anyhow!(
+                "injected library {} (filename={}) not found in pid={} maps. Relevant lines: {:?}",
+                canonical_str,
+                filename,
+                pid,
+                relevant
+            )
+        })?;
+
+    info!(
+        "resolve_injected_symbol: found {} at base=0x{:x} in pid={} maps",
+        canonical_str, base, pid
+    );
+
+    let offset = resolve_symbol_offset(lib_path, symbol)?;
+    Ok(base + offset)
+}
+
+/// Apply a replace_function patch: inject the .so, resolve the new function,
+/// and write a trampoline at the original function's entry point.
+fn apply_replace_function_patch(
+    pid: u32,
+    target: &HotpatchTarget,
+    binary_path: &Path,
+    patches: &mut Vec<PatchedFunction>,
+) {
+    let replace_lib = match &target.replace_lib {
+        Some(lib) => lib.clone(),
+        None => {
+            warn!(
+                "hotpatch replace_function target {}:{} has no replace_lib — skipping",
+                target.binary, target.symbol
+            );
+            return;
+        }
+    };
+
+    let lib_path = Path::new(&replace_lib);
+    if !lib_path.exists() {
+        warn!(
+            "replacement library not found: {} — skipping",
+            replace_lib
+        );
+        return;
+    }
+
+    // Resolve the original function address
+    let func_addr = match resolve_runtime_symbol(pid, binary_path, &target.symbol) {
+        Ok(addr) => addr,
+        Err(err) => {
+            warn!(
+                "cannot resolve {}:{} pid={} for replace_function: {err:#}",
+                target.binary, target.symbol, pid
+            );
+            return;
+        }
+    };
+
+    // Check if already patched
+    if patches.iter().any(|p| p.pid == pid && p.address == func_addr) {
+        info!(
+            "replace_function already applied at {}:{} pid={} addr=0x{:x}",
+            target.binary, target.symbol, pid, func_addr
+        );
+        return;
+    }
+
+    // Step 1: Inject the .so into the target process
+    if let Err(err) = inject_shared_library(pid, lib_path) {
+        warn!(
+            "failed to inject {} into pid={}: {err:#}",
+            replace_lib, pid
+        );
+        return;
+    }
+
+    // Give the target process a moment to finalize the dlopen mmap
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Step 2: Resolve the replacement function's address in the target
+    let replace_sym = target
+        .replace_symbol
+        .as_deref()
+        .unwrap_or(&target.symbol);
+    let new_func_addr = match resolve_injected_symbol(pid, lib_path, replace_sym) {
+        Ok(addr) => addr,
+        Err(err) => {
+            warn!(
+                "cannot resolve replacement symbol {} in {} pid={}: {err:#}",
+                replace_sym, replace_lib, pid
+            );
+            return;
+        }
+    };
+
+    info!(
+        "replace_function: {}:{} pid={} original=0x{:x} replacement=0x{:x} (from {}:{})",
+        target.binary, target.symbol, pid, func_addr, new_func_addr, replace_lib, replace_sym
+    );
+
+    // Step 3: Generate trampoline and write it at the original function entry
+    let trampoline = generate_trampoline(new_func_addr);
+    let result = ptrace_read_and_write(pid, func_addr, &trampoline);
+    match result {
+        Ok(original_bytes) => {
+            patches.push(PatchedFunction {
+                pid,
+                address: func_addr,
+                original_bytes,
+            });
+            info!(
+                "replace_function patch applied: {}:{} pid={} addr=0x{:x} -> 0x{:x}",
+                target.binary, target.symbol, pid, func_addr, new_func_addr
+            );
+        }
+        Err(err) => {
+            warn!(
+                "failed to write trampoline at {}:{} pid={} addr=0x{:x}: {err:#}",
+                target.binary, target.symbol, pid, func_addr
+            );
+        }
+    }
+}
+
+/// Read original bytes and write new bytes at the given address in a single ptrace session.
+/// Supports arbitrary lengths (must be word-aligned for full-word writes).
+/// Returns the original bytes that were read before writing.
+fn ptrace_read_and_write(pid: u32, addr: u64, new_data: &[u8]) -> Result<Vec<u8>> {
+    let word_size = std::mem::size_of::<libc::c_long>();
+    let pid_t = pid as libc::pid_t;
+
+    assert!(
+        new_data.len() % word_size == 0,
+        "patch data length must be a multiple of {} bytes",
+        word_size
+    );
+
+    // Attach
+    let ret = unsafe { libc::ptrace(libc::PTRACE_ATTACH, pid_t, 0, 0) };
+    if ret < 0 {
+        return Err(anyhow!(
+            "ptrace ATTACH failed for pid={}: {}",
+            pid,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // Wait for stop
+    let mut status: libc::c_int = 0;
+    let ret = unsafe { libc::waitpid(pid_t, &mut status, 0) };
+    if ret < 0 {
+        unsafe { libc::ptrace(libc::PTRACE_DETACH, pid_t, 0, 0) };
+        return Err(anyhow!(
+            "waitpid failed for pid={}: {}",
+            pid,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // Read original bytes (word at a time)
+    let mut original_bytes = vec![0u8; new_data.len()];
+    let num_words = new_data.len() / word_size;
+    for i in 0..num_words {
+        let offset = (i * word_size) as u64;
+        unsafe { *libc::__errno_location() = 0 };
+        let word = unsafe {
+            libc::ptrace(
+                libc::PTRACE_PEEKTEXT,
+                pid_t,
+                (addr + offset) as *mut libc::c_void,
+                0,
+            )
+        };
+        let errno = unsafe { *libc::__errno_location() };
+        if errno != 0 {
+            unsafe { libc::ptrace(libc::PTRACE_DETACH, pid_t, 0, 0) };
+            return Err(anyhow!(
+                "ptrace PEEKTEXT failed for pid={} addr=0x{:x}: {}",
+                pid,
+                addr + offset,
+                std::io::Error::from_raw_os_error(errno)
+            ));
+        }
+        let start = i * word_size;
+        original_bytes[start..start + word_size].copy_from_slice(&word.to_ne_bytes());
+    }
+
+    // Write new data (word at a time)
+    for i in 0..num_words {
+        let offset = (i * word_size) as u64;
+        let start = i * word_size;
+        let new_word = libc::c_long::from_ne_bytes(
+            new_data[start..start + word_size].try_into().unwrap(),
+        );
+        let ret = unsafe {
+            libc::ptrace(
+                libc::PTRACE_POKETEXT,
+                pid_t,
+                (addr + offset) as *mut libc::c_void,
+                new_word as *mut libc::c_void,
+            )
+        };
+        if ret < 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe { libc::ptrace(libc::PTRACE_DETACH, pid_t, 0, 0) };
+            return Err(anyhow!(
+                "ptrace POKETEXT failed for pid={} addr=0x{:x}: {}",
+                pid,
+                addr + offset,
+                err
+            ));
+        }
+    }
+
+    // Detach
+    let ret = unsafe { libc::ptrace(libc::PTRACE_DETACH, pid_t, 0, 0) };
+    if ret < 0 {
+        warn!(
+            "ptrace DETACH failed for pid={}: {}",
+            pid,
+            std::io::Error::last_os_error()
+        );
+    }
+
+    Ok(original_bytes)
+}
+
+/// Restore all previously applied code patches.
+fn restore_hotpatch_code_patches(patches: &mut Vec<PatchedFunction>) {
+    for patch in patches.drain(..) {
+        if let Err(err) = write_process_memory(patch.pid, patch.address, &patch.original_bytes) {
+            warn!(
+                "failed to restore original code at pid={} addr=0x{:x}: {err:#}",
+                patch.pid, patch.address
+            );
+        } else {
+            info!(
+                "hotpatch code restored at pid={} addr=0x{:x}",
+                patch.pid, patch.address
+            );
+        }
+    }
+}
+
+/// Generate aarch64 instructions to replace a function with `mov x0, #value; ret`.
+///
+/// For values in range [0, 65535]: `movz x0, #value` + `ret`
+/// For values in range [-65536, -1]: `movn x0, #(~value)` + `ret`
+/// For other values: we use movz + movk sequences (up to 4 instructions),
+/// but for simplicity we limit to 16-bit immediate values and fall back
+/// to a 2-instruction sequence that covers most common return values.
+#[cfg(target_arch = "aarch64")]
+fn generate_patch_instructions(value: i64) -> [u8; 8] {
+    let mut buf = [0u8; 8];
+    let (mov_insn, ret_insn);
+
+    if value >= 0 && value <= 0xFFFF {
+        // movz x0, #value
+        // Encoding: 1 10 100101 00 <imm16> <Rd=00000>
+        // = 0xD2800000 | (imm16 << 5)
+        mov_insn = 0xD280_0000u32 | ((value as u32 & 0xFFFF) << 5);
+    } else if value >= -0x10000 && value < 0 {
+        // movn x0, #(~value & 0xFFFF)
+        // Encoding: 1 00 100101 00 <imm16> <Rd=00000>
+        // = 0x92800000 | (imm16 << 5)
+        let not_val = (!value) as u32 & 0xFFFF;
+        mov_insn = 0x9280_0000u32 | (not_val << 5);
+    } else {
+        // For values outside 16-bit range, use movz for lower 16 bits.
+        // This truncates to 16 bits — acceptable for most error codes and small values.
+        warn!(
+            "hotpatch override value {} exceeds 16-bit range, truncating to lower 16 bits",
+            value
+        );
+        if value >= 0 {
+            mov_insn = 0xD280_0000u32 | (((value as u32) & 0xFFFF) << 5);
+        } else {
+            let not_val = (!value) as u32 & 0xFFFF;
+            mov_insn = 0x9280_0000u32 | (not_val << 5);
+        }
+    }
+
+    // ret (return to LR/x30)
+    // Encoding: 0xD65F03C0
+    ret_insn = 0xD65F_03C0u32;
+
+    buf[0..4].copy_from_slice(&mov_insn.to_le_bytes());
+    buf[4..8].copy_from_slice(&ret_insn.to_le_bytes());
+    buf
+}
+
+#[cfg(target_arch = "x86_64")]
+fn generate_patch_instructions(value: i64) -> [u8; 8] {
+    // x86_64: mov eax, imm32; ret; nop; nop
+    // This covers 32-bit return values which is sufficient for most cases.
+    let mut buf = [0x90u8; 8]; // fill with NOP
+    // mov eax, imm32 = B8 <imm32>
+    buf[0] = 0xB8;
+    buf[1..5].copy_from_slice(&(value as u32).to_le_bytes());
+    // ret = C3
+    buf[5] = 0xC3;
+    buf
+}
+
+/// Attach to a process via ptrace, execute a closure, then detach.
+/// The target process is stopped while the closure runs.
+fn with_ptrace_attach<F, T>(pid: u32, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    let pid_t = pid as libc::pid_t;
+
+    // Attach — this sends SIGSTOP to the target
+    let ret = unsafe { libc::ptrace(libc::PTRACE_ATTACH, pid_t, 0, 0) };
+    if ret < 0 {
+        return Err(anyhow!(
+            "ptrace ATTACH failed for pid={}: {}",
+            pid,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // Wait for the target to actually stop
+    let mut status: libc::c_int = 0;
+    let ret = unsafe { libc::waitpid(pid_t, &mut status, 0) };
+    if ret < 0 {
+        // Try to detach even if waitpid failed
+        unsafe { libc::ptrace(libc::PTRACE_DETACH, pid_t, 0, 0) };
+        return Err(anyhow!(
+            "waitpid failed for pid={}: {}",
+            pid,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let result = f();
+
+    // Detach
+    let ret = unsafe { libc::ptrace(libc::PTRACE_DETACH, pid_t, 0, 0) };
+    if ret < 0 {
+        warn!(
+            "ptrace DETACH failed for pid={}: {}",
+            pid,
+            std::io::Error::last_os_error()
+        );
+    }
+
+    result
+}
+
+/// Read memory from a target process using ptrace PEEKTEXT.
+/// Reads one word (8 bytes on 64-bit) at a time.
+#[allow(dead_code)]
+fn read_process_memory(pid: u32, addr: u64, buf: &mut [u8]) -> Result<()> {
+    let word_size = std::mem::size_of::<libc::c_long>();
+    let pid_t = pid as libc::pid_t;
+
+    with_ptrace_attach(pid, || {
+        let mut offset = 0usize;
+        while offset < buf.len() {
+            // Clear errno before ptrace call (PEEKTEXT returns data, not error code)
+            unsafe { *libc::__errno_location() = 0 };
+            let word = unsafe {
+                libc::ptrace(
+                    libc::PTRACE_PEEKTEXT,
+                    pid_t,
+                    (addr + offset as u64) as *mut libc::c_void,
+                    0,
+                )
+            };
+            let errno = unsafe { *libc::__errno_location() };
+            if errno != 0 {
+                return Err(anyhow!(
+                    "ptrace PEEKTEXT failed for pid={} addr=0x{:x}: {}",
+                    pid,
+                    addr + offset as u64,
+                    std::io::Error::from_raw_os_error(errno)
+                ));
+            }
+            let word_bytes = word.to_ne_bytes();
+            let remaining = buf.len() - offset;
+            let to_copy = remaining.min(word_size);
+            buf[offset..offset + to_copy].copy_from_slice(&word_bytes[..to_copy]);
+            offset += word_size;
+        }
+        Ok(())
+    })
+}
+
+/// Write memory to a target process using ptrace POKETEXT.
+/// This can write to read-only/executable pages (like .text segment).
+/// Writes one word (8 bytes on 64-bit) at a time.
+fn write_process_memory(pid: u32, addr: u64, data: &[u8]) -> Result<()> {
+    let word_size = std::mem::size_of::<libc::c_long>();
+    let pid_t = pid as libc::pid_t;
+
+    with_ptrace_attach(pid, || {
+        let mut offset = 0usize;
+        while offset < data.len() {
+            let remaining = data.len() - offset;
+            let word: libc::c_long = if remaining >= word_size {
+                // Full word write
+                libc::c_long::from_ne_bytes(
+                    data[offset..offset + word_size].try_into().unwrap(),
+                )
+            } else {
+                // Partial word: read existing word first, then overlay our bytes
+                unsafe { *libc::__errno_location() = 0 };
+                let existing = unsafe {
+                    libc::ptrace(
+                        libc::PTRACE_PEEKTEXT,
+                        pid_t,
+                        (addr + offset as u64) as *mut libc::c_void,
+                        0,
+                    )
+                };
+                let errno = unsafe { *libc::__errno_location() };
+                if errno != 0 {
+                    return Err(anyhow!(
+                        "ptrace PEEKTEXT (for partial write) failed: {}",
+                        std::io::Error::from_raw_os_error(errno)
+                    ));
+                }
+                let mut word_bytes = existing.to_ne_bytes();
+                word_bytes[..remaining].copy_from_slice(&data[offset..offset + remaining]);
+                libc::c_long::from_ne_bytes(word_bytes)
+            };
+
+            let ret = unsafe {
+                libc::ptrace(
+                    libc::PTRACE_POKETEXT,
+                    pid_t,
+                    (addr + offset as u64) as *mut libc::c_void,
+                    word as *mut libc::c_void,
+                )
+            };
+            if ret < 0 {
+                return Err(anyhow!(
+                    "ptrace POKETEXT failed for pid={} addr=0x{:x}: {}",
+                    pid,
+                    addr + offset as u64,
+                    std::io::Error::last_os_error()
+                ));
+            }
+            offset += word_size;
+        }
+        Ok(())
+    })
 }
 
 // ── Event collector (async ring buffer reader) ──
@@ -1051,27 +2157,43 @@ fn resolve_runtime_symbol(pid: u32, binary: &Path, symbol: &str) -> Result<u64> 
 }
 
 fn resolve_symbol_offset(binary: &Path, symbol: &str) -> Result<u64> {
+    use object::ObjectSegment;
     let data = fs::read(binary).with_context(|| format!("read binary {}", binary.display()))?;
     let obj = object::File::parse(data.as_slice()).context("parse ELF")?;
 
-    for sym in obj.symbols() {
-        if let Ok(name) = sym.name()
-            && name == symbol
-            && sym.address() > 0
-        {
-            return Ok(sym.address());
+    let mut sym_addr: Option<u64> = None;
+    for s in obj.symbols() {
+        if let Ok(name) = s.name() {
+            if name == symbol && s.address() > 0 {
+                sym_addr = Some(s.address());
+                break;
+            }
         }
     }
-    // Also check dynamic symbols (.dynsym)
-    for sym in obj.dynamic_symbols() {
-        if let Ok(name) = sym.name()
-            && name == symbol
-            && sym.address() > 0
-        {
-            return Ok(sym.address());
+    if sym_addr.is_none() {
+        // Also check dynamic symbols (.dynsym)
+        for s in obj.dynamic_symbols() {
+            if let Ok(name) = s.name() {
+                if name == symbol && s.address() > 0 {
+                    sym_addr = Some(s.address());
+                    break;
+                }
+            }
         }
     }
-    Err(anyhow!("symbol {symbol} not found in {}", binary.display()))
+    let addr = sym_addr.ok_or_else(|| anyhow!("symbol {symbol} not found in {}", binary.display()))?;
+
+    // For non-PIE executables (ET_EXEC), symbol addresses are absolute virtual addresses.
+    // We need to subtract the load base (lowest LOAD segment vaddr) so that
+    // resolve_runtime_symbol can correctly compute: maps_base + offset.
+    // For shared libraries / PIE (ET_DYN), the lowest vaddr is typically 0 so this is a no-op.
+    let load_vaddr = obj
+        .segments()
+        .map(|seg| seg.address())
+        .min()
+        .unwrap_or(0);
+
+    Ok(addr - load_vaddr)
 }
 
 fn resolve_process_mapping_base(pid: u32, binary: &Path) -> Result<u64> {
@@ -1133,6 +2255,7 @@ async fn run_http_server(shared: Shared, addr: String) -> Result<()> {
             axum::routing::delete(api_delete_hotpatch),
         )
         .route("/api/v1/config/toggle", post(api_toggle_item))
+        .route("/api/v1/upload-lib", post(api_upload_lib))
         .route("/api/v1/reload-hotpatch", post(api_reload_hotpatch))
         .with_state(shared)
         .layer(cors)
@@ -1348,6 +2471,20 @@ async fn api_add_hotpatch(
     let targets = policy.hotpatch.targets.clone();
     drop(policy);
     sync_bpf_hotpatch_pids(&shared, &targets);
+    sync_bpf_hotpatch_rules(&shared, &targets);
+    // Auto-attach uprobe probes for newly added targets
+    {
+        let mut bpf_guard = shared.bpf.lock().unwrap();
+        if let Err(err) = attach_hotpatch_targets(&mut bpf_guard, &targets, &shared) {
+            warn!("hotpatch uprobe auto-attach after add: {err:#}");
+        }
+    }
+    // Apply code patches for override_return / skip_call targets
+    {
+        let mut patches = shared.code_patches.lock().unwrap();
+        restore_hotpatch_code_patches(&mut patches);
+        apply_hotpatch_code_patches(&targets, &mut patches);
+    }
     persist_policy(&shared).await;
     Json(targets)
 }
@@ -1363,6 +2500,20 @@ async fn api_update_hotpatch(
     let targets = policy.hotpatch.targets.clone();
     drop(policy);
     sync_bpf_hotpatch_pids(&shared, &targets);
+    sync_bpf_hotpatch_rules(&shared, &targets);
+    // Re-attach uprobe probes to reflect updated targets
+    {
+        let mut bpf_guard = shared.bpf.lock().unwrap();
+        if let Err(err) = attach_hotpatch_targets(&mut bpf_guard, &targets, &shared) {
+            warn!("hotpatch uprobe auto-attach after update: {err:#}");
+        }
+    }
+    // Re-apply code patches (restore old, apply new)
+    {
+        let mut patches = shared.code_patches.lock().unwrap();
+        restore_hotpatch_code_patches(&mut patches);
+        apply_hotpatch_code_patches(&targets, &mut patches);
+    }
     persist_policy(&shared).await;
     Json(targets)
 }
@@ -1378,8 +2529,111 @@ async fn api_delete_hotpatch(
     let targets = policy.hotpatch.targets.clone();
     drop(policy);
     sync_bpf_hotpatch_pids(&shared, &targets);
+    sync_bpf_hotpatch_rules(&shared, &targets);
+    // Restore old patches and re-apply for remaining targets
+    {
+        let mut patches = shared.code_patches.lock().unwrap();
+        restore_hotpatch_code_patches(&mut patches);
+        apply_hotpatch_code_patches(&targets, &mut patches);
+    }
     persist_policy(&shared).await;
     Json(targets)
+}
+
+// ── Upload API: receive a .so file, validate ELF architecture, save to disk ──
+
+async fn api_upload_lib(
+    mut multipart: Multipart,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let mut file_data: Option<Vec<u8>> = None;
+    let mut file_name: Option<String> = None;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "file" {
+            file_name = field.file_name().map(|s| s.to_string());
+            match field.bytes().await {
+                Ok(bytes) => file_data = Some(bytes.to_vec()),
+                Err(e) => return Err((StatusCode::BAD_REQUEST, format!("read field: {e}"))),
+            }
+        }
+    }
+
+    let data = file_data.ok_or_else(|| {
+        (StatusCode::BAD_REQUEST, "missing 'file' field".to_string())
+    })?;
+    let original_name = file_name.unwrap_or_else(|| "uploaded.so".to_string());
+
+    // Validate: must be a valid ELF file
+    let obj = match object::File::parse(data.as_slice()) {
+        Ok(o) => o,
+        Err(e) => return Err((StatusCode::BAD_REQUEST, format!("invalid ELF: {e}"))),
+    };
+
+    // Check architecture matches the host
+    let host_arch = std::env::consts::ARCH; // "aarch64", "x86_64", etc.
+    let elf_arch = match obj.architecture() {
+        object::Architecture::Aarch64 => "aarch64",
+        object::Architecture::X86_64 => "x86_64",
+        other => return Err((
+            StatusCode::BAD_REQUEST,
+            format!("unsupported ELF architecture: {other:?}"),
+        )),
+    };
+    if elf_arch != host_arch {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "architecture mismatch: uploaded .so is {elf_arch} but host is {host_arch}"
+            ),
+        ));
+    }
+
+    // Must be a shared library (ET_DYN)
+    if obj.kind() != object::ObjectKind::Dynamic {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("uploaded file is not a shared library (got {:?}, expected ET_DYN)", obj.kind()),
+        ));
+    }
+
+    // Save to /tmp/gaia-libs/<filename>
+    let lib_dir = PathBuf::from("/tmp/gaia-libs");
+    if let Err(e) = fs::create_dir_all(&lib_dir) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("create lib dir: {e}"),
+        ));
+    }
+    // Sanitize filename
+    let safe_name = original_name
+        .rsplit('/')
+        .next()
+        .unwrap_or("uploaded.so")
+        .replace(|c: char| !c.is_alphanumeric() && c != '.' && c != '_' && c != '-', "_");
+    let dest = lib_dir.join(&safe_name);
+    if let Err(e) = fs::write(&dest, &data) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write file: {e}"),
+        ));
+    }
+    // Make it executable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dest, fs::Permissions::from_mode(0o755));
+    }
+
+    let path_str = dest.to_string_lossy().to_string();
+    info!("uploaded library saved: {} ({} bytes, arch={})", path_str, data.len(), elf_arch);
+
+    Ok(Json(serde_json::json!({
+        "path": path_str,
+        "size": data.len(),
+        "arch": elf_arch,
+        "name": safe_name,
+    })))
 }
 
 // ── Toggle API: enable/disable any config item by section + index ──
@@ -1442,6 +2696,7 @@ async fn api_toggle_item(
             let snapshot = policy.clone();
             drop(policy);
             sync_bpf_hotpatch_pids(&shared, &targets);
+            sync_bpf_hotpatch_rules(&shared, &targets);
             persist_policy(&shared).await;
             return Ok(Json(snapshot));
         }
@@ -1475,8 +2730,16 @@ async fn api_reload_hotpatch(State(shared): State<Shared>) -> Json<ReloadResult>
         attach_hotpatch_targets(&mut bpf_guard, &targets, &shared)
     };
 
-    // Update PID filter map
+    // Update PID filter map and hotpatch rules
     sync_bpf_hotpatch_pids(&shared, &targets);
+    sync_bpf_hotpatch_rules(&shared, &targets);
+
+    // Re-apply code patches
+    {
+        let mut patches = shared.code_patches.lock().unwrap();
+        restore_hotpatch_code_patches(&mut patches);
+        apply_hotpatch_code_patches(&targets, &mut patches);
+    }
 
     match result {
         Ok(()) => {

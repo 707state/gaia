@@ -638,6 +638,7 @@ code {
 .action-log { background: #eff6ff; color: #2563eb; }
 .action-block { background: #fef2f2; color: #dc2626; }
 .action-throttle { background: #fefce8; color: #ca8a04; }
+.action-replace { background: #ecfdf5; color: #059669; }
 
 /* ── Row states ── */
 
@@ -1107,6 +1108,81 @@ opacity: 0.5;
   padding: 2px 8px;
   border-radius: 4px;
   white-space: nowrap;
+}
+
+/* ── Hotpatch-specific ── */
+
+.hotpatch-row {
+  flex-wrap: wrap;
+}
+
+.hotpatch-detail {
+  flex-direction: column !important;
+  align-items: flex-start !important;
+  gap: 6px !important;
+}
+
+.hotpatch-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.hotpatch-action-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.hotpatch-action-select {
+  padding: 4px 8px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  font-size: 11px;
+  background: #fff;
+  cursor: pointer;
+  color: #334155;
+}
+
+.hotpatch-action-select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.hotpatch-retval {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.hotpatch-retval label {
+  font-size: 11px;
+  color: #64748b;
+  white-space: nowrap;
+}
+
+.hotpatch-retval-input {
+  width: 80px;
+  padding: 4px 8px;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  font-size: 11px;
+  font-family: 'IBM Plex Mono', monospace;
+  text-align: center;
+  background: #fff;
+}
+
+.hotpatch-retval-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.hotpatch-retval-input:focus {
+  outline: none;
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.1);
 }
 
 /* ── Add form ── */
