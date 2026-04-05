@@ -1,3 +1,5 @@
+rate_limit_rules = []
+
 [[sensitive_prefixes]]
 value = "/etc/shadow"
 enabled = true
@@ -48,20 +50,16 @@ enabled = true
 
 [baseline_thresholds]
 file_io = 200
-process = 80
-privilege = 20
 network = 160
+privilege = 20
+process = 80
 hotpatch = 50
 
-# IP rate limiting rules
-# [[rate_limit_rules]]
-# cidr = "10.0.0.0/8"
-# max_conn_per_sec = 100
-# action = "log"
-# enabled = true
-
-# Uncomment and adjust to attach uprobe/uretprobe hot-patches:
-# [[hotpatch.targets]]
-# binary = "/usr/sbin/nginx"
-# symbol = "ngx_http_process_request"
-# enabled = true
+[[hotpatch.targets]]
+binary = "/home/jask/lua"
+symbol = "luaB_print"
+pid = 626280
+enabled = false
+patch_action = "replace_function"
+override_return_value = 0
+replace_lib = "/tmp/gaia-libs/liblua.so.5.5"
