@@ -1212,40 +1212,298 @@ fn inject_shared_library(pid: u32, lib_path: &Path) -> Result<()> {
 
 #[cfg(target_arch = "x86_64")]
 fn inject_shared_library(pid: u32, lib_path: &Path) -> Result<()> {
-    // x86_64 implementation uses the same strategy but with different register layout.
-    // For now, delegate to a simpler approach: we just need the .so to be loadable.
-    let _ = (pid, lib_path);
-    Err(anyhow!("inject_shared_library not yet implemented for x86_64"))
+    let pid_t = pid as libc::pid_t;
+    let lib_path_str = lib_path
+        .canonicalize()
+        .unwrap_or_else(|_| lib_path.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    let lib_path_bytes = lib_path_str.as_bytes();
+
+    // Check if already loaded
+    let maps = fs::read_to_string(format!("/proc/{pid}/maps"))
+        .context("read /proc/pid/maps")?;
+    if maps.contains(&lib_path_str) {
+        info!("library {} already loaded in pid={}", lib_path_str, pid);
+        return Ok(());
+    }
+
+    // Find __libc_dlopen_mode address in the target process.
+    let dlopen_addr = resolve_libc_dlopen_in_target(pid)?;
+    info!(
+        "resolved __libc_dlopen_mode in pid={} at 0x{:x}",
+        pid, dlopen_addr
+    );
+
+    // Attach
+    let ret = unsafe { libc::ptrace(libc::PTRACE_ATTACH, pid_t, 0, 0) };
+    if ret < 0 {
+        return Err(anyhow!(
+            "ptrace ATTACH failed for pid={}: {}",
+            pid,
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut status: libc::c_int = 0;
+    unsafe { libc::waitpid(pid_t, &mut status, 0) };
+
+    // Save original registers
+    let mut orig_regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+    let ret = unsafe {
+        libc::ptrace(
+            libc::PTRACE_GETREGS,
+            pid_t,
+            0,
+            &mut orig_regs as *mut _ as *mut libc::c_void,
+        )
+    };
+    if ret < 0 {
+        unsafe { libc::ptrace(libc::PTRACE_DETACH, pid_t, 0, 0) };
+        return Err(anyhow!(
+            "GETREGS failed for pid={}: {}",
+            pid,
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // Write the library path string onto the stack (below current RSP).
+    // Null-terminated and 8-byte aligned.
+    let path_with_nul_len = lib_path_bytes.len() + 1;
+    let aligned_len = (path_with_nul_len + 7) & !7;
+    let mut path_buf = vec![0u8; aligned_len];
+    path_buf[..lib_path_bytes.len()].copy_from_slice(lib_path_bytes);
+
+    let rsp = orig_regs.rsp;
+    // Reserve space below RSP for the path string + 16 bytes padding
+    let string_addr = (rsp - aligned_len as u64 - 16) & !0xF;
+
+    // Write path string via POKETEXT
+    let word_size = std::mem::size_of::<libc::c_long>();
+    for i in (0..aligned_len).step_by(word_size) {
+        let word = libc::c_long::from_ne_bytes(
+            path_buf[i..i + word_size].try_into().unwrap(),
+        );
+        let ret = unsafe {
+            libc::ptrace(
+                libc::PTRACE_POKETEXT,
+                pid_t,
+                (string_addr + i as u64) as *mut libc::c_void,
+                word as *mut libc::c_void,
+            )
+        };
+        if ret < 0 {
+            unsafe { libc::ptrace(libc::PTRACE_DETACH, pid_t, 0, 0) };
+            return Err(anyhow!(
+                "POKETEXT (path string) failed at offset {}: {}",
+                i,
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+
+    // Strategy: Set RIP = __libc_dlopen_mode, push return address 0 onto the stack.
+    // On x86_64, CALL pushes the return address; since we're setting RIP directly
+    // (not using CALL), we simulate this by writing 0 at the top of the stack.
+    // When dlopen executes RET, it pops 0 into RIP → SIGSEGV.
+    //
+    // x86_64 System V ABI: RDI = 1st arg (path), RSI = 2nd arg (flags).
+    // Stack must be 16-byte aligned BEFORE the CALL (i.e. RSP % 16 == 0 before
+    // the return address is pushed). Since we push 8 bytes (the fake return addr),
+    // we set RSP so that (RSP - 8) % 16 == 0, i.e. RSP % 16 == 8.
+    let new_rsp = (string_addr - 8) & !0xF; // 16-byte aligned
+    let fake_ret_rsp = new_rsp - 8; // push fake return address here
+
+    // Write the fake return address (0) at the top of the stack
+    let ret = unsafe {
+        libc::ptrace(
+            libc::PTRACE_POKETEXT,
+            pid_t,
+            fake_ret_rsp as *mut libc::c_void,
+            0 as *mut libc::c_void,
+        )
+    };
+    if ret < 0 {
+        unsafe { libc::ptrace(libc::PTRACE_DETACH, pid_t, 0, 0) };
+        return Err(anyhow!(
+            "POKETEXT (fake return addr) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let mut call_regs = orig_regs;
+    call_regs.rdi = string_addr;       // 1st arg: path to .so
+    call_regs.rsi = 0x2;               // 2nd arg: RTLD_NOW
+    call_regs.rsp = fake_ret_rsp;      // RSP points to the fake return address
+    call_regs.rip = dlopen_addr;       // RIP = __libc_dlopen_mode
+    // CRITICAL: Set orig_rax to -1 to prevent the kernel from restarting a
+    // syscall that was interrupted by our PTRACE_ATTACH. Without this, the
+    // kernel may subtract 2 from RIP on PTRACE_CONT (to re-execute the
+    // `syscall` instruction), causing RIP to land 2 bytes before dlopen.
+    call_regs.orig_rax = (-1i64) as u64;
+
+    let ret = unsafe {
+        libc::ptrace(
+            libc::PTRACE_SETREGS,
+            pid_t,
+            0,
+            &call_regs as *const _ as *mut libc::c_void,
+        )
+    };
+    if ret < 0 {
+        unsafe { libc::ptrace(libc::PTRACE_DETACH, pid_t, 0, 0) };
+        return Err(anyhow!(
+            "SETREGS failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // Continue execution — dlopen will run, then RET pops 0 into RIP → SIGSEGV
+    let ret = unsafe { libc::ptrace(libc::PTRACE_CONT, pid_t, 0, 0) };
+    if ret < 0 {
+        unsafe { libc::ptrace(libc::PTRACE_DETACH, pid_t, 0, 0) };
+        return Err(anyhow!(
+            "PTRACE_CONT failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // Wait for the trap signal (SIGSEGV from RET to address 0)
+    let mut status: libc::c_int = 0;
+    let ret = unsafe { libc::waitpid(pid_t, &mut status, 0) };
+    if ret < 0 {
+        unsafe { libc::ptrace(libc::PTRACE_DETACH, pid_t, 0, 0) };
+        return Err(anyhow!(
+            "waitpid after dlopen call failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // Verify we got a signal stop (SIGSEGV or SIGTRAP)
+    if libc::WIFSTOPPED(status) {
+        let sig = libc::WSTOPSIG(status);
+        if sig != libc::SIGSEGV && sig != libc::SIGTRAP {
+            warn!(
+                "inject_shared_library: unexpected stop signal {} in pid={}",
+                sig, pid
+            );
+        }
+    } else if libc::WIFSIGNALED(status) {
+        unsafe { libc::ptrace(libc::PTRACE_DETACH, pid_t, 0, 0) };
+        return Err(anyhow!(
+            "target pid={} was killed by signal {} during dlopen injection",
+            pid,
+            libc::WTERMSIG(status)
+        ));
+    }
+
+    // Read RAX to check dlopen return value (should be non-null handle)
+    let mut result_regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::ptrace(
+            libc::PTRACE_GETREGS,
+            pid_t,
+            0,
+            &mut result_regs as *mut _ as *mut libc::c_void,
+        )
+    };
+    let dlopen_result = result_regs.rax;
+    let rip_after = result_regs.rip;
+
+    info!(
+        "inject_shared_library: after dlopen call, rax=0x{:x}, rip=0x{:x}, status=0x{:x}",
+        dlopen_result, rip_after, status
+    );
+
+    // Restore original registers
+    unsafe {
+        libc::ptrace(
+            libc::PTRACE_SETREGS,
+            pid_t,
+            0,
+            &orig_regs as *const _ as *mut libc::c_void,
+        )
+    };
+
+    // Detach
+    unsafe { libc::ptrace(libc::PTRACE_DETACH, pid_t, 0, 0) };
+
+    if dlopen_result == 0 {
+        return Err(anyhow!(
+            "dlopen failed in pid={} for library {} (returned NULL)",
+            pid,
+            lib_path_str
+        ));
+    }
+
+    info!(
+        "library {} injected into pid={} (handle=0x{:x})",
+        lib_path_str, pid, dlopen_result
+    );
+    Ok(())
 }
 
-/// Resolve the address of __libc_dlopen_mode in the target process.
+/// Resolve the address of __libc_dlopen_mode (or dlopen) in the target process.
 ///
-/// Strategy: find libc's base address in the target's /proc/pid/maps,
+/// Strategy: find libc's load base address in the target's /proc/pid/maps,
 /// then find the symbol offset from the libc .so file on disk.
+///
+/// We look for the first mapping of libc with file offset 0 (the load base),
+/// not the r-xp segment, because `resolve_symbol_offset` returns offsets relative
+/// to the ELF load base (lowest LOAD segment vaddr, typically 0 for shared libs).
+/// On newer glibc (2.35+), the first mapping is r--p (read-only data) at offset 0,
+/// followed by r-xp at a non-zero offset, so using r-xp would produce a wrong address.
 fn resolve_libc_dlopen_in_target(pid: u32) -> Result<u64> {
     let maps = fs::read_to_string(format!("/proc/{pid}/maps"))
         .context("read /proc/pid/maps")?;
 
-    // Find the first executable mapping of libc
+    // Find the first mapping of libc (file offset 0 = load base).
+    // Fall back to the first r-xp mapping if no offset-0 mapping is found.
     let mut libc_base: Option<u64> = None;
     let mut libc_path: Option<String> = None;
+    let mut fallback_base: Option<u64> = None;
+    let mut fallback_path: Option<String> = None;
+
     for line in maps.lines() {
-        // Look for libc.so or libc-*.so
-        if (line.contains("libc.so") || line.contains("libc-")) && line.contains("r-xp") {
-            let mut fields = line.split_whitespace();
-            if let Some(range) = fields.next() {
-                if let Some((start_str, _)) = range.split_once('-') {
-                    libc_base = u64::from_str_radix(start_str, 16).ok();
+        if !(line.contains("libc.so") || line.contains("libc-")) {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let range = match fields.next() {
+            Some(r) => r,
+            None => continue,
+        };
+        let _perms = fields.next();
+        let offset_str = fields.next().unwrap_or("0");
+        let path_field = line.split_whitespace().last().unwrap_or("").to_string();
+
+        if let Some((start_str, _)) = range.split_once('-') {
+            if let Ok(addr) = u64::from_str_radix(start_str, 16) {
+                // Prefer the mapping with file offset 0 (true load base)
+                if offset_str == "00000000" && libc_base.is_none() {
+                    libc_base = Some(addr);
+                    libc_path = Some(path_field.clone());
+                }
+                // Keep first r-xp as fallback (for older kernels/glibc)
+                if line.contains("r-xp") && fallback_base.is_none() {
+                    fallback_base = Some(addr);
+                    fallback_path = Some(path_field);
                 }
             }
-            // The path is the last field
-            libc_path = line.split_whitespace().last().map(|s| s.to_string());
+        }
+
+        // If we found the offset-0 base, we're done
+        if libc_base.is_some() && fallback_base.is_some() {
             break;
         }
     }
 
-    let base = libc_base.ok_or_else(|| anyhow!("cannot find libc mapping in pid={}", pid))?;
-    let path = libc_path.ok_or_else(|| anyhow!("cannot find libc path in pid={}", pid))?;
+    // Use offset-0 base if available, otherwise fall back to r-xp base
+    let base = libc_base
+        .or(fallback_base)
+        .ok_or_else(|| anyhow!("cannot find libc mapping in pid={}", pid))?;
+    let path = libc_path
+        .or(fallback_path)
+        .ok_or_else(|| anyhow!("cannot find libc path in pid={}", pid))?;
 
     // Resolve __libc_dlopen_mode offset from the libc binary
     let offset = resolve_symbol_offset(Path::new(&path), "__libc_dlopen_mode")
@@ -1257,6 +1515,11 @@ fn resolve_libc_dlopen_in_target(pid: u32) -> Result<u64> {
 
 /// Resolve the runtime address of a symbol in an injected .so within the target process.
 /// Parses /proc/<pid>/maps to find the .so's load base, then adds the symbol offset.
+///
+/// We prefer the mapping with file offset 0 (the true load base) because
+/// `resolve_symbol_offset` returns offsets relative to the ELF load base.
+/// On newer kernels/glibc, the first mapping may be r--p (read-only) at offset 0,
+/// with r-xp at a non-zero offset.
 fn resolve_injected_symbol(pid: u32, lib_path: &Path, symbol: &str) -> Result<u64> {
     let canonical = lib_path
         .canonicalize()
@@ -1271,9 +1534,10 @@ fn resolve_injected_symbol(pid: u32, lib_path: &Path, symbol: &str) -> Result<u6
     let maps = fs::read_to_string(format!("/proc/{pid}/maps"))
         .context("read /proc/pid/maps")?;
 
-    // Strategy: collect all mappings that match the library, prefer r-xp but accept any.
-    // Match by canonical path first, then fall back to filename.
-    let mut best_base: Option<(u64, bool)> = None; // (addr, is_executable)
+    // Strategy: prefer the mapping with file offset 0 (true load base).
+    // Fall back to the first mapping (any permission) if no offset-0 mapping is found.
+    let mut offset0_base: Option<u64> = None;
+    let mut first_base: Option<u64> = None;
     for line in maps.lines() {
         // Check if this line references our library (by full path or filename)
         let path_field = line.split_whitespace().last().unwrap_or("");
@@ -1283,26 +1547,29 @@ fn resolve_injected_symbol(pid: u32, lib_path: &Path, symbol: &str) -> Result<u6
             continue;
         }
 
-        let is_exec = line.contains("r-xp");
         let mut fields = line.split_whitespace();
-        if let Some(range) = fields.next() {
-            if let Some((start_str, _)) = range.split_once('-') {
-                if let Ok(addr) = u64::from_str_radix(start_str, 16) {
-                    match best_base {
-                        None => best_base = Some((addr, is_exec)),
-                        Some((_, false)) if is_exec => best_base = Some((addr, is_exec)),
-                        _ => {} // keep existing r-xp match or first match
-                    }
-                    if is_exec {
-                        break; // r-xp is ideal, stop searching
-                    }
+        let range = match fields.next() {
+            Some(r) => r,
+            None => continue,
+        };
+        let _perms = fields.next();
+        let offset_str = fields.next().unwrap_or("0");
+
+        if let Some((start_str, _)) = range.split_once('-') {
+            if let Ok(addr) = u64::from_str_radix(start_str, 16) {
+                if first_base.is_none() {
+                    first_base = Some(addr);
+                }
+                if offset_str == "00000000" && offset0_base.is_none() {
+                    offset0_base = Some(addr);
+                    break; // offset-0 is the true load base, stop searching
                 }
             }
         }
     }
 
-    let base = best_base
-        .map(|(addr, _)| addr)
+    let base = offset0_base
+        .or(first_base)
         .ok_or_else(|| {
             // Dump maps lines containing the filename for debugging
             let relevant: Vec<&str> = maps
