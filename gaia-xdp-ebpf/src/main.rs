@@ -6,9 +6,9 @@ use aya_ebpf::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid, bpf_ktime_get_ns,
         bpf_probe_read_user, bpf_probe_read_user_str_bytes,
     },
-    macros::{kprobe, map, tracepoint, uprobe, uretprobe},
+    macros::{cgroup_sock_addr, kprobe, map, tracepoint, uprobe, uretprobe},
     maps::{Array, HashMap, RingBuf},
-    programs::{ProbeContext, RetProbeContext, TracePointContext},
+    programs::{ProbeContext, RetProbeContext, SockAddrContext, TracePointContext},
 };
 // Note: bpf_override_return only works with kprobes on error-injectable kernel
 // functions. It does NOT work with uprobes. For userspace function patching,
@@ -630,6 +630,71 @@ fn u64_to_ascii(mut val: u64, out: &mut [u8]) -> usize {
         i += 1;
     }
     i
+}
+
+// ── Port Blocking Agent (cgroup/sock_addr) ──
+// These programs are attached to the root cgroup and can actually BLOCK
+// connect/bind syscalls by returning 0 (deny) or 1 (allow).
+
+#[cgroup_sock_addr(connect4)]
+pub fn cgroup_connect4(ctx: SockAddrContext) -> i32 {
+    match try_block_port(&ctx) {
+        Ok(blocked) => if blocked { 0 } else { 1 },
+        Err(_) => 1, // allow on error
+    }
+}
+
+#[cgroup_sock_addr(bind4)]
+pub fn cgroup_bind4(ctx: SockAddrContext) -> i32 {
+    match try_block_port(&ctx) {
+        Ok(blocked) => if blocked { 0 } else { 1 },
+        Err(_) => 1, // allow on error
+    }
+}
+
+#[cgroup_sock_addr(connect6)]
+pub fn cgroup_connect6(ctx: SockAddrContext) -> i32 {
+    match try_block_port(&ctx) {
+        Ok(blocked) => if blocked { 0 } else { 1 },
+        Err(_) => 1, // allow on error
+    }
+}
+
+#[cgroup_sock_addr(bind6)]
+pub fn cgroup_bind6(ctx: SockAddrContext) -> i32 {
+    match try_block_port(&ctx) {
+        Ok(blocked) => if blocked { 0 } else { 1 },
+        Err(_) => 1, // allow on error
+    }
+}
+
+/// Read the destination/bind port from bpf_sock_addr and check BLOCKED_PORTS map.
+/// Returns Ok(true) if the port should be blocked.
+fn try_block_port(ctx: &SockAddrContext) -> Result<bool, i32> {
+    let sa = unsafe { &*ctx.sock_addr };
+    // user_port contains the port in network byte order (big-endian) in the low 16 bits
+    // of a __u32. The kernel sets it as: ctx->user_port = (__force __u32)sin->sin_port.
+    // We extract the low 16 bits and convert from network to host byte order.
+    let port = u16::from_be(sa.user_port as u16);
+
+    if port == 0 {
+        return Ok(false);
+    }
+
+    if unsafe { BLOCKED_PORTS.get(&port).is_some() } {
+        // Emit an event so the user-space daemon knows we blocked something
+        if let Some(ptr) = get_scratch() {
+            let event = unsafe { &mut *ptr };
+            fill_base(event, EVENT_KIND_NETWORK, EVENT_ACTION_BLOCKED);
+            event.protocol = PROTOCOL_TCP;
+            event.port = port;
+            copy_bytes(&mut event.detail, b"cgroup:port-blocked");
+            emit(event);
+        }
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 #[cfg(not(test))]

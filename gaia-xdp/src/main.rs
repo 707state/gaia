@@ -19,7 +19,7 @@ use axum::{
 use aya::{
     Ebpf,
     maps::{Array as BpfArray, HashMap as BpfHashMap, MapData, ring_buf::RingBuf},
-    programs::{KProbe, TracePoint, UProbe},
+    programs::{CgroupAttachMode, CgroupSockAddr, KProbe, TracePoint, UProbe},
 };
 use clap::Parser;
 use gaia_xdp_common::{
@@ -438,7 +438,65 @@ fn attach_agents(bpf: &mut Ebpf) -> Result<()> {
         .context("attach kprobe tcp_connect")?;
     info!("hot-patch kprobe guard attached on tcp_connect");
 
+    // Port Blocking Agent (cgroup/connect4 + cgroup/bind4)
+    // Attach to root cgroup so it applies system-wide.
+    let cgroup_path = find_cgroup_root()?;
+    let cgroup_fd = std::fs::File::open(&cgroup_path)
+        .with_context(|| format!("open cgroup root {}", cgroup_path.display()))?;
+
+    let prog: &mut CgroupSockAddr = bpf
+        .program_mut("cgroup_connect4")
+        .context("missing cgroup_connect4")?
+        .try_into()
+        .context("cgroup_connect4 cast")?;
+    prog.load().context("load cgroup_connect4")?;
+    prog.attach(&cgroup_fd, CgroupAttachMode::Single)
+        .context("attach cgroup_connect4")?;
+    info!("port blocking agent attached: cgroup/connect4 on {}", cgroup_path.display());
+
+    let prog: &mut CgroupSockAddr = bpf
+        .program_mut("cgroup_bind4")
+        .context("missing cgroup_bind4")?
+        .try_into()
+        .context("cgroup_bind4 cast")?;
+    prog.load().context("load cgroup_bind4")?;
+    prog.attach(&cgroup_fd, CgroupAttachMode::Single)
+        .context("attach cgroup_bind4")?;
+    info!("port blocking agent attached: cgroup/bind4 on {}", cgroup_path.display());
+
+    let prog: &mut CgroupSockAddr = bpf
+        .program_mut("cgroup_connect6")
+        .context("missing cgroup_connect6")?
+        .try_into()
+        .context("cgroup_connect6 cast")?;
+    prog.load().context("load cgroup_connect6")?;
+    prog.attach(&cgroup_fd, CgroupAttachMode::Single)
+        .context("attach cgroup_connect6")?;
+    info!("port blocking agent attached: cgroup/connect6 on {}", cgroup_path.display());
+
+    let prog: &mut CgroupSockAddr = bpf
+        .program_mut("cgroup_bind6")
+        .context("missing cgroup_bind6")?
+        .try_into()
+        .context("cgroup_bind6 cast")?;
+    prog.load().context("load cgroup_bind6")?;
+    prog.attach(&cgroup_fd, CgroupAttachMode::Single)
+        .context("attach cgroup_bind6")?;
+    info!("port blocking agent attached: cgroup/bind6 on {}", cgroup_path.display());
+
     Ok(())
+}
+
+/// Find the root cgroup v2 mount point.
+fn find_cgroup_root() -> Result<PathBuf> {
+    // Try common cgroup v2 paths
+    for path in &["/sys/fs/cgroup"] {
+        let p = Path::new(path);
+        if p.join("cgroup.controllers").exists() {
+            return Ok(p.to_path_buf());
+        }
+    }
+    anyhow::bail!("could not find cgroup v2 root mount point")
 }
 
 fn attach_tracepoint(bpf: &mut Ebpf, prog_name: &str, category: &str, name: &str) -> Result<()> {
@@ -2278,10 +2336,22 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
 
     // Active defense: blocked port
     if event.kind == EVENT_KIND_NETWORK && event.action == EVENT_ACTION_BLOCKED {
+        info!(
+            "BLOCKED port {} ({}) by {} (pid={}, detail={})",
+            record.network.as_ref().map(|n| n.port).unwrap_or(0),
+            record.network.as_ref().map(|n| n.address.as_str()).unwrap_or("?"),
+            record.comm,
+            record.pid,
+            record.detail,
+        );
         push_alert(
             &mut state,
             "critical",
-            "blocked port hit — active defense policy triggered".into(),
+            format!(
+                "blocked port {} hit — active defense policy triggered ({})",
+                record.network.as_ref().map(|n| n.port).unwrap_or(0),
+                record.detail,
+            ),
             &record,
         );
     }
@@ -2330,8 +2400,15 @@ fn push_alert(state: &mut RuntimeState, level: &str, reason: String, event: &Eve
         reason,
         event: event.clone(),
     });
+    // When trimming, prefer dropping lower-severity alerts to keep critical ones visible.
     while state.alerts.len() > MAX_ALERT_HISTORY {
-        state.alerts.pop_back();
+        // Try to drop the oldest non-critical alert first.
+        if let Some(pos) = state.alerts.iter().rposition(|a| a.level != "critical") {
+            state.alerts.remove(pos);
+        } else {
+            // All alerts are critical; drop the oldest.
+            state.alerts.pop_back();
+        }
     }
 }
 
