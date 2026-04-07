@@ -502,6 +502,23 @@
   font-family: 'IBM Plex Mono', monospace;
 }
 
+/* ── Service badge in event table ── */
+
+.service-badge {
+  display: inline-block;
+  font-size: 11px;
+  background: #dbeafe;
+  color: #1e40af;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.no-service {
+  color: #94a3b8;
+}
+
 /* ── Counter list ── */
 
 .counter-list {

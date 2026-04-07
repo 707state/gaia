@@ -15,7 +15,7 @@ value = "/var/lib/gaia"
 enabled = true
 
 [[monitored_services]]
-value = "sshd.service"
+value = "ssh.service"
 enabled = true
 
 [[monitored_services]]

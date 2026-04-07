@@ -217,6 +217,9 @@ struct EventRecord {
     comm: String,
     detail: String,
     network: Option<NetworkView>,
+    /// The systemd service this event belongs to, if the PID is tracked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -287,6 +290,11 @@ struct BaselineState {
 struct RuntimeState {
     counters: HashMap<String, u64>,
     service_map: HashMap<String, Vec<u32>>,
+    /// Reverse lookup: PID → service name, rebuilt by the service tracker.
+    pid_to_service: HashMap<u32, String>,
+    /// Reverse lookup: comm name (e.g. "sshd") → service name, for matching
+    /// short-lived child processes that may not yet appear in pid_to_service.
+    comm_to_service: HashMap<String, String>,
     events: VecDeque<EventRecord>,
     alerts: VecDeque<AlertRecord>,
     baseline: BaselineState,
@@ -298,6 +306,8 @@ impl RuntimeState {
         Self {
             counters: HashMap::new(),
             service_map: HashMap::new(),
+            pid_to_service: HashMap::new(),
+            comm_to_service: HashMap::new(),
             events: VecDeque::new(),
             alerts: VecDeque::new(),
             baseline: BaselineState {
@@ -2130,24 +2140,64 @@ fn spawn_service_tracker(shared: Shared) {
             let services = shared.policy.read().await.monitored_services.clone();
             let enabled: Vec<&ToggleItem> = services.iter().filter(|s| s.enabled).collect();
             if enabled.is_empty() {
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                // Clear stale data when nothing is enabled.
+                let mut state = shared.runtime.write().await;
+                if !state.service_map.is_empty() {
+                    state.service_map.clear();
+                    state.pid_to_service.clear();
+                    state.comm_to_service.clear();
+                }
+                drop(state);
+                tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
             let mut mapping = HashMap::<String, Vec<u32>>::new();
+            let mut reverse = HashMap::<u32, String>::new();
+            let mut comm_map = HashMap::<String, String>::new();
             for service in &enabled {
-                if let Some(pid) = query_service_pid(&service.value).await {
-                    mapping.insert(service.value.clone(), vec![pid]);
+                let pids = query_service_pids(&service.value).await;
+                for &pid in &pids {
+                    reverse.insert(pid, service.value.clone());
+                    // Read the comm name of each tracked PID so we can match
+                    // short-lived children by process name even if they haven't
+                    // been scanned yet.
+                    if let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) {
+                        let comm = comm.trim().to_string();
+                        if !comm.is_empty() {
+                            comm_map.entry(comm).or_insert_with(|| service.value.clone());
+                        }
+                    }
+                }
+                if !pids.is_empty() {
+                    mapping.insert(service.value.clone(), pids);
                 }
             }
             let mut state = shared.runtime.write().await;
             state.service_map = mapping;
+            state.pid_to_service = reverse;
+            state.comm_to_service = comm_map;
             drop(state);
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
 }
 
-async fn query_service_pid(service: &str) -> Option<u32> {
+/// Query all PIDs belonging to a systemd service (main + children).
+async fn query_service_pids(service: &str) -> Vec<u32> {
+    // First get the MainPID via systemctl.
+    let main_pid = match query_main_pid(service).await {
+        Some(pid) => pid,
+        None => return Vec::new(),
+    };
+
+    let mut pids = Vec::new();
+    // Collect the full process tree rooted at main_pid.
+    collect_descendant_pids(main_pid, &mut pids);
+    pids
+}
+
+/// Get the MainPID of a systemd service.
+async fn query_main_pid(service: &str) -> Option<u32> {
     let output = Command::new("systemctl")
         .arg("show")
         .arg(service)
@@ -2165,6 +2215,29 @@ async fn query_service_pid(service: &str) -> Option<u32> {
         .parse::<u32>()
         .ok()?;
     (pid > 0).then_some(pid)
+}
+
+/// Recursively collect a PID and all its descendants by reading /proc.
+fn collect_descendant_pids(pid: u32, out: &mut Vec<u32>) {
+    out.push(pid);
+    // Read /proc/<pid>/task/<tid>/children for each thread of this process.
+    let task_dir = format!("/proc/{pid}/task");
+    let tasks = match fs::read_dir(&task_dir) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    for entry in tasks.flatten() {
+        let children_path = entry.path().join("children");
+        if let Ok(content) = fs::read_to_string(&children_path) {
+            for tok in content.split_whitespace() {
+                if let Ok(child) = tok.parse::<u32>() {
+                    if !out.contains(&child) {
+                        collect_descendant_pids(child, out);
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ── Network traffic sampler ──
@@ -2273,9 +2346,18 @@ fn spawn_traffic_sampler(shared: Shared) {
 // ── Anomaly detection engine ──
 
 async fn process_event(event: KernelEvent, shared: &Shared) {
-    let record = to_event_record(event);
+    let mut record = to_event_record(event);
     let mut state = shared.runtime.write().await;
     let policy = shared.policy.read().await;
+
+    // ── Service attribution: match PID, TGID, or comm name to a tracked service ──
+    let service = state
+        .pid_to_service
+        .get(&record.pid)
+        .or_else(|| state.pid_to_service.get(&record.tgid))
+        .or_else(|| state.comm_to_service.get(&record.comm))
+        .cloned();
+    record.service = service.clone();
 
     let key = record.kind.clone();
     *state.counters.entry(key.clone()).or_insert(0) += 1;
@@ -2366,6 +2448,51 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
         );
     }
 
+    // ── Service-specific alerts: flag notable activity from monitored services ──
+    if let Some(ref svc) = service {
+        // Alert on sensitive file access by a monitored service
+        if event.kind == EVENT_KIND_FILE_IO && event.action == EVENT_ACTION_ALERT {
+            push_alert(
+                &mut state,
+                "high",
+                format!("monitored service [{svc}] accessed sensitive file: {}", record.detail),
+                &record,
+            );
+        }
+        // Alert on network activity from a monitored service
+        if event.kind == EVENT_KIND_NETWORK {
+            let addr_info = record
+                .network
+                .as_ref()
+                .map(|n| format!("{}:{}", n.address, n.port))
+                .unwrap_or_default();
+            push_alert(
+                &mut state,
+                "medium",
+                format!("monitored service [{svc}] network activity: {addr_info}"),
+                &record,
+            );
+        }
+        // Alert on privilege changes within a monitored service
+        if event.kind == EVENT_KIND_PRIVILEGE {
+            push_alert(
+                &mut state,
+                "critical",
+                format!("monitored service [{svc}] privilege change: {}", record.detail),
+                &record,
+            );
+        }
+        // Alert on process execution from a monitored service
+        if event.kind == EVENT_KIND_PROCESS {
+            push_alert(
+                &mut state,
+                "medium",
+                format!("monitored service [{svc}] exec: {}", record.detail),
+                &record,
+            );
+        }
+    }
+
     state.events.push_front(record);
     while state.events.len() > MAX_EVENT_HISTORY {
         state.events.pop_back();
@@ -2437,6 +2564,7 @@ fn to_event_record(event: KernelEvent) -> EventRecord {
         comm,
         detail,
         network,
+        service: None, // filled in by process_event after service lookup
     }
 }
 

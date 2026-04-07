@@ -14,6 +14,7 @@ type EventRecord = {
   comm: string
   detail: string
   network?: { port: number; address: string }
+  service?: string
 }
 
 type AlertRecord = { level: string; reason: string; event: EventRecord }
@@ -1165,6 +1166,7 @@ function EventTable({ events, lang, tr }: { events: EventRecord[]; lang: Lang; t
             <th>{tr('时间', 'Time')}</th>
             <th>{tr('类型', 'Kind')}</th>
             <th>{tr('动作', 'Action')}</th>
+            <th>{tr('服务', 'Service')}</th>
             <th>{tr('进程', 'Process')}</th>
             <th>PID</th>
             <th>UID</th>
@@ -1178,6 +1180,7 @@ function EventTable({ events, lang, tr }: { events: EventRecord[]; lang: Lang; t
               <td className="td-time">{formatTimestamp(e.timestamp_ns)}</td>
               <td><span className={`kind-tag kind-${e.kind}`}>{mapKind(e.kind, lang)}</span></td>
               <td><span className={`action-tag action-${e.action}`}>{mapAction(e.action, lang)}</span></td>
+              <td>{e.service ? <span className="service-badge">{e.service}</span> : <span className="no-service">-</span>}</td>
               <td><code>{e.comm || '-'}</code></td>
               <td>{e.pid}</td>
               <td>{e.uid}</td>
@@ -1204,6 +1207,7 @@ function AlertList({ alerts, lang }: { alerts: AlertRecord[]; lang: Lang }) {
           <div className="alert-meta">
             <span>{mapKind(a.event.kind, lang)}</span>
             <span>{mapAction(a.event.action, lang)}</span>
+            {a.event.service && <span className="service-badge">{a.event.service}</span>}
             <span>PID: {a.event.pid}</span>
             <span>{a.event.comm}</span>
             {a.event.network && <span>{a.event.network.address}:{a.event.network.port}</span>}
