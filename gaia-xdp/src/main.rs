@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
-    extract::{Multipart, State},
+    extract::{Multipart, Path as AxumPath, State},
     http::{HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -239,10 +239,23 @@ struct AlertRecord {
 struct Snapshot {
     features: FeatureStatus,
     counters: HashMap<String, u64>,
-    services: HashMap<String, Vec<u32>>,
+    services: HashMap<String, ServiceStatus>,
     events: Vec<EventRecord>,
     alerts: Vec<AlertRecord>,
     traffic: TrafficSnapshot,
+}
+
+/// Systemd service status as reported by `systemctl show`.
+#[derive(Debug, Clone, Serialize)]
+struct ServiceStatus {
+    /// e.g. "active", "inactive", "failed"
+    active_state: String,
+    /// e.g. "running", "dead", "exited", "waiting"
+    sub_state: String,
+    /// Combined human-readable form, e.g. "active (running)"
+    state: String,
+    /// PIDs belonging to this service's cgroup.
+    pids: Vec<u32>,
 }
 
 /// Real-time network traffic data (bytes per second, sampled every 1s).
@@ -289,7 +302,7 @@ struct BaselineState {
 #[derive(Debug)]
 struct RuntimeState {
     counters: HashMap<String, u64>,
-    service_map: HashMap<String, Vec<u32>>,
+    service_map: HashMap<String, ServiceStatus>,
     /// Reverse lookup: PID → service name, rebuilt by the service tracker.
     pid_to_service: HashMap<u32, String>,
     /// Reverse lookup: comm name (e.g. "sshd") → service name, for matching
@@ -2151,16 +2164,14 @@ fn spawn_service_tracker(shared: Shared) {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
-            let mut mapping = HashMap::<String, Vec<u32>>::new();
+            let mut mapping = HashMap::<String, ServiceStatus>::new();
             let mut reverse = HashMap::<u32, String>::new();
             let mut comm_map = HashMap::<String, String>::new();
             for service in &enabled {
                 let pids = query_service_pids(&service.value).await;
+                let (active_state, sub_state) = query_service_state(&service.value).await;
                 for &pid in &pids {
                     reverse.insert(pid, service.value.clone());
-                    // Read the comm name of each tracked PID so we can match
-                    // short-lived children by process name even if they haven't
-                    // been scanned yet.
                     if let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) {
                         let comm = comm.trim().to_string();
                         if !comm.is_empty() {
@@ -2168,9 +2179,17 @@ fn spawn_service_tracker(shared: Shared) {
                         }
                     }
                 }
-                if !pids.is_empty() {
-                    mapping.insert(service.value.clone(), pids);
-                }
+                let state = if sub_state.is_empty() {
+                    active_state.clone()
+                } else {
+                    format!("{active_state} ({sub_state})")
+                };
+                mapping.insert(service.value.clone(), ServiceStatus {
+                    active_state,
+                    sub_state,
+                    state,
+                    pids,
+                });
             }
             let mut state = shared.runtime.write().await;
             state.service_map = mapping;
@@ -2182,21 +2201,58 @@ fn spawn_service_tracker(shared: Shared) {
     });
 }
 
-/// Query all PIDs belonging to a systemd service (main + children).
+/// Query all PIDs belonging to a systemd service via its cgroup.
+///
+/// This reads the service's ControlGroup path from systemctl, then reads
+/// `/sys/fs/cgroup/<path>/cgroup.procs` which contains exactly the PIDs
+/// that systemd considers part of the service — matching `systemctl status`.
+///
+/// Falls back to MainPID if the cgroup approach fails (e.g. cgroup v1).
 async fn query_service_pids(service: &str) -> Vec<u32> {
-    // First get the MainPID via systemctl.
-    let main_pid = match query_main_pid(service).await {
-        Some(pid) => pid,
-        None => return Vec::new(),
-    };
-
-    let mut pids = Vec::new();
-    // Collect the full process tree rooted at main_pid.
-    collect_descendant_pids(main_pid, &mut pids);
-    pids
+    // Try the cgroup approach first (cgroup v2, unified hierarchy).
+    if let Some(pids) = query_cgroup_pids(service).await {
+        if !pids.is_empty() {
+            return pids;
+        }
+    }
+    // Fallback: just return the MainPID.
+    match query_main_pid(service).await {
+        Some(pid) => vec![pid],
+        None => Vec::new(),
+    }
 }
 
-/// Get the MainPID of a systemd service.
+/// Read PIDs from the service's cgroup.procs file.
+async fn query_cgroup_pids(service: &str) -> Option<Vec<u32>> {
+    // Get the cgroup path, e.g. "/system.slice/ssh.service"
+    let output = Command::new("systemctl")
+        .arg("show")
+        .arg(service)
+        .arg("--property")
+        .arg("ControlGroup")
+        .arg("--value")
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let cgroup_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if cgroup_path.is_empty() {
+        return None;
+    }
+    // Read /sys/fs/cgroup/<path>/cgroup.procs
+    let procs_file = format!("/sys/fs/cgroup{cgroup_path}/cgroup.procs");
+    let content = fs::read_to_string(&procs_file).ok()?;
+    let pids: Vec<u32> = content
+        .split_whitespace()
+        .filter_map(|s| s.parse::<u32>().ok())
+        .filter(|&p| p > 0)
+        .collect();
+    Some(pids)
+}
+
+/// Get the MainPID of a systemd service (fallback).
 async fn query_main_pid(service: &str) -> Option<u32> {
     let output = Command::new("systemctl")
         .arg("show")
@@ -2217,26 +2273,28 @@ async fn query_main_pid(service: &str) -> Option<u32> {
     (pid > 0).then_some(pid)
 }
 
-/// Recursively collect a PID and all its descendants by reading /proc.
-fn collect_descendant_pids(pid: u32, out: &mut Vec<u32>) {
-    out.push(pid);
-    // Read /proc/<pid>/task/<tid>/children for each thread of this process.
-    let task_dir = format!("/proc/{pid}/task");
-    let tasks = match fs::read_dir(&task_dir) {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-    for entry in tasks.flatten() {
-        let children_path = entry.path().join("children");
-        if let Ok(content) = fs::read_to_string(&children_path) {
-            for tok in content.split_whitespace() {
-                if let Ok(child) = tok.parse::<u32>() {
-                    if !out.contains(&child) {
-                        collect_descendant_pids(child, out);
-                    }
-                }
-            }
+/// Query the ActiveState and SubState of a systemd service.
+/// Returns e.g. ("active", "running") or ("inactive", "dead").
+async fn query_service_state(service: &str) -> (String, String) {
+    let output = Command::new("systemctl")
+        .arg("show")
+        .arg(service)
+        .arg("--property")
+        .arg("ActiveState")
+        .arg("--property")
+        .arg("SubState")
+        .arg("--value")
+        .output()
+        .await;
+    match output {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            let mut lines = text.lines();
+            let active = lines.next().unwrap_or("unknown").trim().to_string();
+            let sub = lines.next().unwrap_or("").trim().to_string();
+            (active, sub)
         }
+        _ => ("unknown".to_string(), String::new()),
     }
 }
 
@@ -2695,6 +2753,271 @@ fn resolve_process_mapping_base(pid: u32, binary: &Path) -> Result<u64> {
     Err(anyhow!("binary mapping not found for pid {pid}"))
 }
 
+// ── Process detail API ──
+
+/// Detailed information about a single Linux process, read from /proc.
+#[derive(Debug, Serialize)]
+struct ProcessDetail {
+    pid: u32,
+    name: String,
+    state: String,
+    ppid: u32,
+    uid: u32,
+    gid: u32,
+    euid: u32,
+    egid: u32,
+    threads: u32,
+    cmdline: String,
+    exe: String,
+    cwd: String,
+    /// Uptime in seconds since the process started.
+    uptime_secs: u64,
+    /// Memory info (all in kB).
+    mem: ProcessMemory,
+    /// I/O counters.
+    io: ProcessIo,
+    /// Open file descriptors.
+    fds: Vec<FdEntry>,
+    /// Context switch counts.
+    voluntary_ctxt_switches: u64,
+    nonvoluntary_ctxt_switches: u64,
+    /// OOM score (0-1000).
+    oom_score: i32,
+    /// Security info.
+    seccomp: String,
+    cap_eff: String,
+    /// Environment variables (key=value pairs).
+    environ: Vec<String>,
+    /// CPU affinity.
+    cpus_allowed_list: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProcessMemory {
+    vm_peak_kb: u64,
+    vm_size_kb: u64,
+    vm_rss_kb: u64,
+    vm_swap_kb: u64,
+    vm_data_kb: u64,
+    vm_stk_kb: u64,
+    vm_exe_kb: u64,
+    vm_lib_kb: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ProcessIo {
+    rchar: u64,
+    wchar: u64,
+    syscr: u64,
+    syscw: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct FdEntry {
+    fd: i32,
+    target: String,
+}
+
+/// Read a /proc file and return its contents, or empty string on failure.
+fn read_proc(pid: u32, file: &str) -> String {
+    fs::read_to_string(format!("/proc/{pid}/{file}")).unwrap_or_default()
+}
+
+/// Parse a "Key:\tValue kB" line from /proc/status.
+fn status_kb(status: &str, key: &str) -> u64 {
+    for line in status.lines() {
+        if line.starts_with(key) {
+            // Format: "VmRSS:\t    8372 kB"
+            let val = line.split_whitespace().nth(1).unwrap_or("0");
+            return val.parse().unwrap_or(0);
+        }
+    }
+    0
+}
+
+/// Parse a "Key:\tValue" line from /proc/status (no unit).
+fn status_val(status: &str, key: &str) -> String {
+    for line in status.lines() {
+        if line.starts_with(key) {
+            return line.splitn(2, ':').nth(1).unwrap_or("").trim().to_string();
+        }
+    }
+    String::new()
+}
+
+/// Parse a "key: value" line from /proc/pid/io.
+fn io_val(io: &str, key: &str) -> u64 {
+    for line in io.lines() {
+        if line.starts_with(key) {
+            let val = line.splitn(2, ':').nth(1).unwrap_or("0").trim();
+            return val.parse().unwrap_or(0);
+        }
+    }
+    0
+}
+
+/// Compute process uptime from /proc/<pid>/stat field 22 (starttime in clock ticks).
+fn compute_uptime_secs(pid: u32) -> u64 {
+    let stat = read_proc(pid, "stat");
+    // Field 22 (1-indexed) is starttime in clock ticks since boot.
+    // We need to skip past the comm field which is in parens and may contain spaces.
+    let after_comm = match stat.rfind(')') {
+        Some(pos) => &stat[pos + 2..], // skip ") "
+        None => return 0,
+    };
+    // Fields after comm: state(3), ppid(4), ... starttime is field 22, which is
+    // the 20th field after comm (fields 3..22 = 20 fields, index 19).
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    if fields.len() < 20 {
+        return 0;
+    }
+    let starttime_ticks: u64 = fields[19].parse().unwrap_or(0);
+    let clk_tck: u64 = 100; // sysconf(_SC_CLK_TCK), almost always 100 on Linux
+
+    // Read system uptime
+    let uptime_str = fs::read_to_string("/proc/uptime").unwrap_or_default();
+    let system_uptime_secs: f64 = uptime_str
+        .split_whitespace()
+        .next()
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0.0);
+
+    let process_start_secs = starttime_ticks / clk_tck;
+    let uptime = system_uptime_secs as u64;
+    uptime.saturating_sub(process_start_secs)
+}
+
+fn read_process_detail(pid: u32) -> Option<ProcessDetail> {
+    let status = read_proc(pid, "status");
+    if status.is_empty() {
+        return None; // process doesn't exist
+    }
+
+    let name = status_val(&status, "Name:");
+    let state = status_val(&status, "State:");
+    let ppid: u32 = status_val(&status, "PPid:").parse().unwrap_or(0);
+    let threads: u32 = status_val(&status, "Threads:").parse().unwrap_or(0);
+
+    // UID/GID: "Uid:\treal eff saved fs"
+    let uid_line = status_val(&status, "Uid:");
+    let uid_parts: Vec<u32> = uid_line.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+    let uid = uid_parts.first().copied().unwrap_or(0);
+    let euid = uid_parts.get(1).copied().unwrap_or(0);
+
+    let gid_line = status_val(&status, "Gid:");
+    let gid_parts: Vec<u32> = gid_line.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+    let gid = gid_parts.first().copied().unwrap_or(0);
+    let egid = gid_parts.get(1).copied().unwrap_or(0);
+
+    let cmdline_raw = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    let cmdline = cmdline_raw
+        .split(|b| *b == 0)
+        .map(|s| String::from_utf8_lossy(s).to_string())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let exe = fs::read_link(format!("/proc/{pid}/exe"))
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let cwd = fs::read_link(format!("/proc/{pid}/cwd"))
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let mem = ProcessMemory {
+        vm_peak_kb: status_kb(&status, "VmPeak:"),
+        vm_size_kb: status_kb(&status, "VmSize:"),
+        vm_rss_kb: status_kb(&status, "VmRSS:"),
+        vm_swap_kb: status_kb(&status, "VmSwap:"),
+        vm_data_kb: status_kb(&status, "VmData:"),
+        vm_stk_kb: status_kb(&status, "VmStk:"),
+        vm_exe_kb: status_kb(&status, "VmExe:"),
+        vm_lib_kb: status_kb(&status, "VmLib:"),
+    };
+
+    let io_raw = read_proc(pid, "io");
+    let io = ProcessIo {
+        rchar: io_val(&io_raw, "rchar:"),
+        wchar: io_val(&io_raw, "wchar:"),
+        syscr: io_val(&io_raw, "syscr:"),
+        syscw: io_val(&io_raw, "syscw:"),
+        read_bytes: io_val(&io_raw, "read_bytes:"),
+        write_bytes: io_val(&io_raw, "write_bytes:"),
+    };
+
+    // File descriptors
+    let mut fds = Vec::new();
+    if let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) {
+        for entry in entries.flatten() {
+            if let Ok(fd_num) = entry.file_name().to_string_lossy().parse::<i32>() {
+                let target = fs::read_link(entry.path())
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| "?".into());
+                fds.push(FdEntry { fd: fd_num, target });
+            }
+        }
+    }
+    fds.sort_by_key(|f| f.fd);
+
+    let voluntary_ctxt_switches: u64 = status_val(&status, "voluntary_ctxt_switches:")
+        .parse()
+        .unwrap_or(0);
+    let nonvoluntary_ctxt_switches: u64 = status_val(&status, "nonvoluntary_ctxt_switches:")
+        .parse()
+        .unwrap_or(0);
+
+    let oom_score: i32 = read_proc(pid, "oom_score").trim().parse().unwrap_or(0);
+    let seccomp = status_val(&status, "Seccomp:");
+    let cap_eff = status_val(&status, "CapEff:");
+    let cpus_allowed_list = status_val(&status, "Cpus_allowed_list:");
+
+    // Environment variables
+    let environ_raw = fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+    let environ: Vec<String> = environ_raw
+        .split(|b| *b == 0)
+        .map(|s| String::from_utf8_lossy(s).to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let uptime_secs = compute_uptime_secs(pid);
+
+    Some(ProcessDetail {
+        pid,
+        name,
+        state,
+        ppid,
+        uid,
+        gid,
+        euid,
+        egid,
+        threads,
+        cmdline,
+        exe,
+        cwd,
+        uptime_secs,
+        mem,
+        io,
+        fds,
+        voluntary_ctxt_switches,
+        nonvoluntary_ctxt_switches,
+        oom_score,
+        seccomp,
+        cap_eff,
+        environ,
+        cpus_allowed_list,
+    })
+}
+
+async fn api_process_detail(AxumPath(pid): AxumPath<u32>) -> Response {
+    match read_process_detail(pid) {
+        Some(detail) => Json(detail).into_response(),
+        None => (StatusCode::NOT_FOUND, format!("process {pid} not found")).into_response(),
+    }
+}
+
 // ── HTTP API ──
 
 async fn run_http_server(shared: Shared, addr: String) -> Result<()> {
@@ -2727,6 +3050,7 @@ async fn run_http_server(shared: Shared, addr: String) -> Result<()> {
             axum::routing::delete(api_delete_hotpatch),
         )
         .route("/api/v1/config/toggle", post(api_toggle_item))
+        .route("/api/v1/process/{pid}", get(api_process_detail))
         .route("/api/v1/upload-lib", post(api_upload_lib))
         .route("/api/v1/reload-hotpatch", post(api_reload_hotpatch))
         .with_state(shared)

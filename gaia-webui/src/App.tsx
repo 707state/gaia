@@ -43,15 +43,41 @@ type Snapshot = {
     symbol_resolver: boolean
   }
   counters: Record<string, number>
-  services: Record<string, number[]>
+  services: Record<string, ServiceStatusInfo>
   events: EventRecord[]
   alerts: AlertRecord[]
   traffic: TrafficSnapshot
 }
 
+type ServiceStatusInfo = {
+  active_state: string
+  sub_state: string
+  state: string
+  pids: number[]
+}
+
 type ToggleItem = {
   value: string
   enabled: boolean
+}
+
+type ProcessMemory = {
+  vm_peak_kb: number; vm_size_kb: number; vm_rss_kb: number; vm_swap_kb: number
+  vm_data_kb: number; vm_stk_kb: number; vm_exe_kb: number; vm_lib_kb: number
+}
+type ProcessIo = {
+  rchar: number; wchar: number; syscr: number; syscw: number
+  read_bytes: number; write_bytes: number
+}
+type FdEntry = { fd: number; target: string }
+type ProcessDetail = {
+  pid: number; name: string; state: string; ppid: number
+  uid: number; gid: number; euid: number; egid: number; threads: number
+  cmdline: string; exe: string; cwd: string; uptime_secs: number
+  mem: ProcessMemory; io: ProcessIo; fds: FdEntry[]
+  voluntary_ctxt_switches: number; nonvoluntary_ctxt_switches: number
+  oom_score: number; seccomp: string; cap_eff: string
+  environ: string[]; cpus_allowed_list: string
 }
 
 type TogglePort = {
@@ -105,10 +131,10 @@ const mockSnapshot: Snapshot = {
   },
   counters: { file_io: 341, process: 88, privilege: 5, network: 152, hotpatch: 11 },
   services: {
-    'sshd.service': [721],
-    'nginx.service': [1142, 1145, 1148],
-    'redis.service': [2001],
-    'postgresql.service': [3010, 3011],
+    'sshd.service': { active_state: 'active', sub_state: 'running', state: 'active (running)', pids: [721] },
+    'nginx.service': { active_state: 'active', sub_state: 'running', state: 'active (running)', pids: [1142, 1145, 1148] },
+    'redis.service': { active_state: 'active', sub_state: 'running', state: 'active (running)', pids: [2001] },
+    'postgresql.service': { active_state: 'active', sub_state: 'running', state: 'active (running)', pids: [3010, 3011] },
   },
   events: [
     {
@@ -298,8 +324,23 @@ function App() {
   const [lang, setLang] = useState<Lang>(initialLang)
   const [snapshot, setSnapshot] = useState<Snapshot>(mockSnapshot)
   const [live, setLive] = useState(false)
+  const [procDetail, setProcDetail] = useState<ProcessDetail | null>(null)
+  const [procLoading, setProcLoading] = useState(false)
 
   const tr = useCallback((zh: string, en: string) => (lang === 'zh' ? zh : en), [lang])
+
+  const openProcessDetail = useCallback(async (pid: number) => {
+    setProcLoading(true)
+    setProcDetail(null)
+    try {
+      const r = await fetch(`/api/v1/process/${pid}`)
+      if (r.ok) {
+        const data = (await r.json()) as ProcessDetail
+        setProcDetail(data)
+      }
+    } catch { /* ignore */ }
+    setProcLoading(false)
+  }, [])
 
   useEffect(() => { localStorage.setItem('gaia_lang', lang) }, [lang])
 
@@ -376,7 +417,7 @@ function App() {
         </header>
 
         <div className="content-body">
-          {tab === 'overview' && <OverviewTab snapshot={snapshot} totalEvents={totalEvents} lang={lang} tr={tr} />}
+          {tab === 'overview' && <OverviewTab snapshot={snapshot} totalEvents={totalEvents} lang={lang} tr={tr} onPidClick={openProcessDetail} />}
           {tab === 'file' && <FileTab snapshot={snapshot} lang={lang} tr={tr} />}
           {tab === 'process' && <ProcessTab snapshot={snapshot} lang={lang} tr={tr} />}
           {tab === 'network' && <NetworkTab snapshot={snapshot} lang={lang} tr={tr} />}
@@ -385,14 +426,21 @@ function App() {
           {tab === 'config' && <ConfigTab lang={lang} tr={tr} />}
         </div>
       </main>
+
+      <ProcessDetailModal
+        detail={procDetail}
+        loading={procLoading}
+        tr={tr}
+        onClose={() => { setProcDetail(null); setProcLoading(false) }}
+      />
     </div>
   )
 }
 
 // ── Overview Tab ──
 
-function OverviewTab({ snapshot, totalEvents, lang, tr }: {
-  snapshot: Snapshot; totalEvents: number; lang: Lang; tr: (zh: string, en: string) => string
+function OverviewTab({ snapshot, totalEvents, lang, tr, onPidClick }: {
+  snapshot: Snapshot; totalEvents: number; lang: Lang; tr: (zh: string, en: string) => string; onPidClick?: (pid: number) => void
 }) {
   const criticals = snapshot.alerts.filter(a => a.level === 'critical').length
   const highs = snapshot.alerts.filter(a => a.level === 'high').length
@@ -463,14 +511,15 @@ function OverviewTab({ snapshot, totalEvents, lang, tr }: {
             <h3>{tr('Systemd 服务追踪', 'Systemd Service Tracker')}</h3>
           </div>
           <div className="service-list">
-            {Object.entries(snapshot.services).map(([svc, pids]) => (
+            {Object.entries(snapshot.services).map(([svc, info]) => (
               <div key={svc} className="service-item">
                 <div className="service-name">
-                  <span className="service-dot" />
+                  <span className={`service-dot ${info.active_state === 'active' ? 'dot-active' : info.active_state === 'failed' ? 'dot-failed' : 'dot-inactive'}`} />
                   {svc}
+                  <span className={`systemd-state ${info.active_state === 'active' ? 'state-active' : info.active_state === 'failed' ? 'state-failed' : 'state-inactive'}`}>{info.state}</span>
                 </div>
                 <div className="service-pids">
-                  {pids.map(p => <code key={p} className="pid-tag">{p}</code>)}
+                  {info.pids.map(p => <code key={p} className="pid-tag clickable" onClick={() => onPidClick?.(p)} title={tr('点击查看进程详情', 'Click to view process details')}>{p}</code>)}
                 </div>
               </div>
             ))}
@@ -1675,6 +1724,156 @@ function HotpatchConfigPanel({ targets, setTargets, toggle, flash, tr }: {
             />
           </div>
         )}
+      </div>
+    </div>
+  )
+}
+
+// ── Process Detail Modal ──
+
+function ProcessDetailModal({ detail, loading, tr, onClose }: {
+  detail: ProcessDetail | null; loading: boolean
+  tr: (zh: string, en: string) => string; onClose: () => void
+}) {
+  if (!loading && !detail) return null
+
+  const formatBytes = (b: number) => {
+    if (b < 1024) return `${b} B`
+    if (b < 1048576) return `${(b / 1024).toFixed(1)} KB`
+    if (b < 1073741824) return `${(b / 1048576).toFixed(1)} MB`
+    return `${(b / 1073741824).toFixed(2)} GB`
+  }
+
+  const formatUptime = (secs: number) => {
+    const d = Math.floor(secs / 86400)
+    const h = Math.floor((secs % 86400) / 3600)
+    const m = Math.floor((secs % 3600) / 60)
+    const s = Math.floor(secs % 60)
+    const parts: string[] = []
+    if (d > 0) parts.push(`${d}d`)
+    if (h > 0) parts.push(`${h}h`)
+    if (m > 0) parts.push(`${m}m`)
+    parts.push(`${s}s`)
+    return parts.join(' ')
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-panel" onClick={e => e.stopPropagation()}>
+        <div className="modal-header">
+          <h3>{tr('进程详情', 'Process Detail')}{detail ? ` — PID ${detail.pid}` : ''}</h3>
+          <button className="modal-close" onClick={onClose}>✕</button>
+        </div>
+        <div className="modal-body">
+          {loading && <div className="modal-loading">{tr('加载中...', 'Loading...')}</div>}
+          {!loading && detail && (
+            <>
+              {/* Basic Info */}
+              <section className="detail-section">
+                <h4>{tr('基本信息', 'Basic Info')}</h4>
+                <div className="detail-grid">
+                  <div className="detail-item"><span className="detail-label">PID</span><span className="detail-value">{detail.pid}</span></div>
+                  <div className="detail-item"><span className="detail-label">PPID</span><span className="detail-value">{detail.ppid}</span></div>
+                  <div className="detail-item"><span className="detail-label">{tr('进程名', 'Name')}</span><span className="detail-value">{detail.name}</span></div>
+                  <div className="detail-item"><span className="detail-label">{tr('状态', 'State')}</span><span className="detail-value"><span className={`state-badge state-${detail.state.toLowerCase()}`}>{detail.state}</span></span></div>
+                  <div className="detail-item"><span className="detail-label">UID / EUID</span><span className="detail-value">{detail.uid} / {detail.euid}</span></div>
+                  <div className="detail-item"><span className="detail-label">GID / EGID</span><span className="detail-value">{detail.gid} / {detail.egid}</span></div>
+                  <div className="detail-item"><span className="detail-label">{tr('线程数', 'Threads')}</span><span className="detail-value">{detail.threads}</span></div>
+                  <div className="detail-item"><span className="detail-label">{tr('运行时间', 'Uptime')}</span><span className="detail-value">{formatUptime(detail.uptime_secs)}</span></div>
+                  <div className="detail-item"><span className="detail-label">OOM Score</span><span className="detail-value">{detail.oom_score}</span></div>
+                </div>
+              </section>
+
+              {/* Executable & Paths */}
+              <section className="detail-section">
+                <h4>{tr('路径信息', 'Paths')}</h4>
+                <div className="detail-paths">
+                  <div className="path-row"><span className="detail-label">{tr('可执行文件', 'Executable')}</span><code>{detail.exe}</code></div>
+                  <div className="path-row"><span className="detail-label">{tr('工作目录', 'CWD')}</span><code>{detail.cwd}</code></div>
+                  <div className="path-row"><span className="detail-label">{tr('命令行', 'Cmdline')}</span><code className="cmdline">{detail.cmdline}</code></div>
+                </div>
+              </section>
+
+              {/* Memory */}
+              <section className="detail-section">
+                <h4>{tr('内存使用', 'Memory')}</h4>
+                <div className="detail-grid">
+                  <div className="detail-item"><span className="detail-label">VmPeak</span><span className="detail-value">{formatBytes(detail.mem.vm_peak_kb * 1024)}</span></div>
+                  <div className="detail-item"><span className="detail-label">VmSize</span><span className="detail-value">{formatBytes(detail.mem.vm_size_kb * 1024)}</span></div>
+                  <div className="detail-item"><span className="detail-label">VmRSS</span><span className="detail-value">{formatBytes(detail.mem.vm_rss_kb * 1024)}</span></div>
+                  <div className="detail-item"><span className="detail-label">VmData</span><span className="detail-value">{formatBytes(detail.mem.vm_data_kb * 1024)}</span></div>
+                  <div className="detail-item"><span className="detail-label">VmStk</span><span className="detail-value">{formatBytes(detail.mem.vm_stk_kb * 1024)}</span></div>
+                  <div className="detail-item"><span className="detail-label">VmExe</span><span className="detail-value">{formatBytes(detail.mem.vm_exe_kb * 1024)}</span></div>
+                  <div className="detail-item"><span className="detail-label">VmLib</span><span className="detail-value">{formatBytes(detail.mem.vm_lib_kb * 1024)}</span></div>
+                  <div className="detail-item"><span className="detail-label">VmSwap</span><span className="detail-value">{formatBytes(detail.mem.vm_swap_kb * 1024)}</span></div>
+                </div>
+              </section>
+
+              {/* I/O */}
+              <section className="detail-section">
+                <h4>{tr('I/O 统计', 'I/O Stats')}</h4>
+                <div className="detail-grid">
+                  <div className="detail-item"><span className="detail-label">{tr('逻辑读', 'Logical Read')}</span><span className="detail-value">{formatBytes(detail.io.rchar)}</span></div>
+                  <div className="detail-item"><span className="detail-label">{tr('逻辑写', 'Logical Write')}</span><span className="detail-value">{formatBytes(detail.io.wchar)}</span></div>
+                  <div className="detail-item"><span className="detail-label">{tr('磁盘读', 'Disk Read')}</span><span className="detail-value">{formatBytes(detail.io.read_bytes)}</span></div>
+                  <div className="detail-item"><span className="detail-label">{tr('磁盘写', 'Disk Write')}</span><span className="detail-value">{formatBytes(detail.io.write_bytes)}</span></div>
+                  <div className="detail-item"><span className="detail-label">{tr('读系统调用', 'Read Syscalls')}</span><span className="detail-value">{detail.io.syscr.toLocaleString()}</span></div>
+                  <div className="detail-item"><span className="detail-label">{tr('写系统调用', 'Write Syscalls')}</span><span className="detail-value">{detail.io.syscw.toLocaleString()}</span></div>
+                </div>
+              </section>
+
+              {/* Security & Scheduling */}
+              <section className="detail-section">
+                <h4>{tr('安全与调度', 'Security & Scheduling')}</h4>
+                <div className="detail-grid">
+                  <div className="detail-item"><span className="detail-label">CapEff</span><span className="detail-value" style={{fontSize: 11, wordBreak: 'break-all'}}>{detail.cap_eff}</span></div>
+                  <div className="detail-item"><span className="detail-label">Seccomp</span><span className="detail-value">{detail.seccomp}</span></div>
+                  <div className="detail-item"><span className="detail-label">{tr('允许 CPU', 'CPUs Allowed')}</span><span className="detail-value">{detail.cpus_allowed_list}</span></div>
+                  <div className="detail-item"><span className="detail-label">{tr('主动上下文切换', 'Vol. Ctx Switches')}</span><span className="detail-value">{detail.voluntary_ctxt_switches.toLocaleString()}</span></div>
+                  <div className="detail-item"><span className="detail-label">{tr('被动上下文切换', 'Invol. Ctx Switches')}</span><span className="detail-value">{detail.nonvoluntary_ctxt_switches.toLocaleString()}</span></div>
+                </div>
+              </section>
+
+              {/* File Descriptors */}
+              <section className="detail-section">
+                <h4>{tr('文件描述符', 'File Descriptors')} ({detail.fds.length})</h4>
+                <div className="fd-table-wrap">
+                  <table className="fd-table">
+                    <thead>
+                      <tr><th>FD</th><th>{tr('目标', 'Target')}</th></tr>
+                    </thead>
+                    <tbody>
+                      {detail.fds.slice(0, 50).map(fd => (
+                        <tr key={fd.fd}><td className="fd-num">{fd.fd}</td><td className="fd-path"><code>{fd.target}</code></td></tr>
+                      ))}
+                      {detail.fds.length > 50 && (
+                        <tr><td colSpan={2} className="fd-more">{tr(`... 还有 ${detail.fds.length - 50} 个`, `... ${detail.fds.length - 50} more`)}</td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+
+              {/* Environment Variables */}
+              {detail.environ.length > 0 && (
+                <section className="detail-section">
+                  <h4>{tr('环境变量', 'Environment Variables')} ({detail.environ.length})</h4>
+                  <div className="env-list">
+                    {detail.environ.slice(0, 30).map((env, i) => {
+                      const eq = env.indexOf('=')
+                      const k = eq > 0 ? env.slice(0, eq) : env
+                      const v = eq > 0 ? env.slice(eq + 1) : ''
+                      return <div key={i} className="env-row"><span className="env-key">{k}</span><span className="env-eq">=</span><span className="env-val">{v}</span></div>
+                    })}
+                    {detail.environ.length > 30 && (
+                      <div className="env-more">{tr(`... 还有 ${detail.environ.length - 30} 个`, `... ${detail.environ.length - 30} more`)}</div>
+                    )}
+                  </div>
+                </section>
+              )}
+            </>
+          )}
+        </div>
       </div>
     </div>
   )
