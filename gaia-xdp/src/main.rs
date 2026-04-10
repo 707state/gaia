@@ -7,13 +7,14 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use std::convert::Infallible;
 
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
     extract::{Multipart, Path as AxumPath, State},
     http::{HeaderValue, Method, StatusCode, Uri, header},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Response, sse::{Event, KeepAlive, Sse}},
     routing::{get, post},
 };
 use aya::{
@@ -38,8 +39,10 @@ use tokio::{
     net::TcpListener,
     process::Command,
     signal,
-    sync::RwLock,
+    sync::{RwLock, broadcast},
 };
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt as TokioStreamExt;
 use tower_http::cors::CorsLayer;
 
 /// WebUI static assets embedded at compile time.
@@ -51,6 +54,76 @@ const DEFAULT_CONFIG: &str = "gaia.toml";
 const MAX_EVENT_HISTORY: usize = 512;
 const MAX_ALERT_HISTORY: usize = 256;
 const BASELINE_WINDOW_SECS: u64 = 30;
+/// Capacity of the broadcast channel for AI alert notifications.
+const AI_ALERT_CHANNEL_CAP: usize = 64;
+/// Maximum number of recent events to include as context in AI chat.
+const AI_CONTEXT_EVENTS: usize = 20;
+
+// ── AI Analysis System ──
+
+/// Supported LLM providers.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum AiProvider {
+    #[default]
+    OpenAi,
+    Ollama,
+    Custom,
+}
+
+/// Persisted AI configuration (stored alongside the main policy).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct AiConfig {
+    /// Whether the AI analysis feature is enabled.
+    #[serde(default)]
+    enabled: bool,
+    /// LLM provider.
+    #[serde(default)]
+    provider: AiProvider,
+    /// API base URL (overrides default for the provider).
+    /// For Ollama this defaults to "http://localhost:11434".
+    #[serde(default)]
+    base_url: String,
+    /// Model name, e.g. "gpt-4o", "llama3", "qwen2.5".
+    #[serde(default = "default_ai_model")]
+    model: String,
+    /// API key (empty for Ollama / local models).
+    #[serde(default)]
+    api_key: String,
+}
+
+fn default_ai_model() -> String {
+    "gpt-4o-mini".to_string()
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: AiProvider::OpenAi,
+            base_url: String::new(),
+            model: default_ai_model(),
+            api_key: String::new(),
+        }
+    }
+}
+
+/// A high-severity alert notification pushed to AI event stream subscribers.
+#[derive(Debug, Clone, Serialize)]
+struct AiAlertNotification {
+    /// ISO-8601 timestamp string.
+    timestamp: String,
+    /// Alert level: "critical" | "high".
+    level: String,
+    /// Human-readable reason.
+    reason: String,
+    /// Abbreviated event context.
+    event_kind: String,
+    event_action: String,
+    pid: u32,
+    comm: String,
+    detail: String,
+}
 
 // ── CLI ──
 
@@ -342,6 +415,10 @@ struct Shared {
     symbol_resolver_ok: Arc<Mutex<bool>>,
     /// Tracks code patches applied via process_vm_writev so they can be restored.
     code_patches: Arc<Mutex<Vec<PatchedFunction>>>,
+    /// AI analysis system configuration.
+    ai_config: Arc<RwLock<AiConfig>>,
+    /// Broadcast channel for pushing high-severity alert notifications to AI event stream.
+    ai_alert_tx: broadcast::Sender<AiAlertNotification>,
 }
 
 // ── main ──
@@ -364,6 +441,11 @@ async fn main() -> Result<()> {
     apply_blocked_ports(&mut bpf, &policy.blocked_ports).context("configure blocked ports")?;
     apply_rate_limit_rules(&mut bpf, &policy.rate_limit_rules).context("configure rate limits")?;
 
+    let (ai_alert_tx, _) = broadcast::channel::<AiAlertNotification>(AI_ALERT_CHANNEL_CAP);
+    // Load AI config from a sidecar file next to the main config.
+    let ai_config = load_ai_config(&opt.config);
+    info!("AI analysis system: enabled={}", ai_config.enabled);
+
     let shared = Shared {
         policy: Arc::new(RwLock::new(policy.clone())),
         config_path: opt.config.clone(),
@@ -372,6 +454,8 @@ async fn main() -> Result<()> {
         hotpatch_active: Arc::new(Mutex::new(false)),
         symbol_resolver_ok: Arc::new(Mutex::new(true)),
         code_patches: Arc::new(Mutex::new(Vec::new())),
+        ai_config: Arc::new(RwLock::new(ai_config)),
+        ai_alert_tx,
     };
 
     // The kprobe guard was already attached in attach_agents(), so the
@@ -2407,6 +2491,8 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
     let mut record = to_event_record(event);
     let mut state = shared.runtime.write().await;
     let policy = shared.policy.read().await;
+    // Collect AI notifications to send after releasing the write lock.
+    let mut ai_notifications: Vec<AiAlertNotification> = Vec::new();
 
     // ── Service attribution: match PID, TGID, or comm name to a tracked service ──
     let service = state
@@ -2433,12 +2519,12 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
     if let Some(threshold) = policy.baseline_thresholds.get(&key)
         && baseline_now > *threshold
     {
-        push_alert(
+        if let Some(n) = push_alert(
             &mut state,
             "medium",
             format!("syscall baseline exceeded for {key}: {baseline_now} > {threshold}"),
             &record,
-        );
+        ) { ai_notifications.push(n); }
     }
 
     // Whitelist rule: sensitive file access
@@ -2446,32 +2532,32 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
         && event.action == EVENT_ACTION_ALERT
         && file_path_sensitive(&record.detail, &policy)
     {
-        push_alert(
+        if let Some(n) = push_alert(
             &mut state,
             "high",
             "sensitive file accessed".into(),
             &record,
-        );
+        ) { ai_notifications.push(n); }
     }
 
     // Whitelist rule: execve path check
     if event.kind == EVENT_KIND_PROCESS && !exec_path_whitelisted(&record.detail, &policy) {
-        push_alert(
+        if let Some(n) = push_alert(
             &mut state,
             "high",
             "execve target not in whitelist prefixes".into(),
             &record,
-        );
+        ) { ai_notifications.push(n); }
     }
 
     // Privilege escalation alert
     if event.kind == EVENT_KIND_PRIVILEGE {
-        push_alert(
+        if let Some(n) = push_alert(
             &mut state,
             "high",
             "privilege change detected".into(),
             &record,
-        );
+        ) { ai_notifications.push(n); }
     }
 
     // Active defense: blocked port
@@ -2484,7 +2570,7 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
             record.pid,
             record.detail,
         );
-        push_alert(
+        if let Some(n) = push_alert(
             &mut state,
             "critical",
             format!(
@@ -2493,29 +2579,29 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
                 record.detail,
             ),
             &record,
-        );
+        ) { ai_notifications.push(n); }
     }
 
     // Rate limit exceeded
     if event.kind == EVENT_KIND_NETWORK && event.action == EVENT_ACTION_RATE_LIMITED {
-        push_alert(
+        if let Some(n) = push_alert(
             &mut state,
             "high",
             format!("IP rate limit exceeded — {}", record.detail),
             &record,
-        );
+        ) { ai_notifications.push(n); }
     }
 
     // ── Service-specific alerts: flag notable activity from monitored services ──
     if let Some(ref svc) = service {
         // Alert on sensitive file access by a monitored service
         if event.kind == EVENT_KIND_FILE_IO && event.action == EVENT_ACTION_ALERT {
-            push_alert(
+            if let Some(n) = push_alert(
                 &mut state,
                 "high",
                 format!("monitored service [{svc}] accessed sensitive file: {}", record.detail),
                 &record,
-            );
+            ) { ai_notifications.push(n); }
         }
         // Alert on network activity from a monitored service
         if event.kind == EVENT_KIND_NETWORK {
@@ -2524,36 +2610,45 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
                 .as_ref()
                 .map(|n| format!("{}:{}", n.address, n.port))
                 .unwrap_or_default();
-            push_alert(
+            if let Some(n) = push_alert(
                 &mut state,
                 "medium",
                 format!("monitored service [{svc}] network activity: {addr_info}"),
                 &record,
-            );
+            ) { ai_notifications.push(n); }
         }
         // Alert on privilege changes within a monitored service
         if event.kind == EVENT_KIND_PRIVILEGE {
-            push_alert(
+            if let Some(n) = push_alert(
                 &mut state,
                 "critical",
                 format!("monitored service [{svc}] privilege change: {}", record.detail),
                 &record,
-            );
+            ) { ai_notifications.push(n); }
         }
         // Alert on process execution from a monitored service
         if event.kind == EVENT_KIND_PROCESS {
-            push_alert(
+            if let Some(n) = push_alert(
                 &mut state,
                 "medium",
                 format!("monitored service [{svc}] exec: {}", record.detail),
                 &record,
-            );
+            ) { ai_notifications.push(n); }
         }
     }
 
     state.events.push_front(record);
     while state.events.len() > MAX_EVENT_HISTORY {
         state.events.pop_back();
+    }
+    // Release locks before broadcasting to avoid holding them during channel send.
+    drop(state);
+    drop(policy);
+
+    // Broadcast high/critical alert notifications to AI event stream subscribers.
+    for notification in ai_notifications {
+        // Ignore send errors (no active subscribers is fine).
+        let _ = shared.ai_alert_tx.send(notification);
     }
 }
 
@@ -2579,10 +2674,18 @@ fn file_path_sensitive(path: &str, policy: &MonitorPolicy) -> bool {
     enabled.iter().any(|prefix| path.starts_with(prefix))
 }
 
-fn push_alert(state: &mut RuntimeState, level: &str, reason: String, event: &EventRecord) {
+/// Push an alert into the runtime state and return an `AiAlertNotification`
+/// for high/critical severity events so the caller can forward it to the AI
+/// broadcast channel.
+fn push_alert(
+    state: &mut RuntimeState,
+    level: &str,
+    reason: String,
+    event: &EventRecord,
+) -> Option<AiAlertNotification> {
     state.alerts.push_front(AlertRecord {
         level: level.to_string(),
-        reason,
+        reason: reason.clone(),
         event: event.clone(),
     });
     // When trimming, prefer dropping lower-severity alerts to keep critical ones visible.
@@ -2594,6 +2697,26 @@ fn push_alert(state: &mut RuntimeState, level: &str, reason: String, event: &Eve
             // All alerts are critical; drop the oldest.
             state.alerts.pop_back();
         }
+    }
+
+    // Only propagate high/critical alerts to the AI event stream.
+    if level == "critical" || level == "high" {
+        let ts_ms = event.timestamp_ns / 1_000_000;
+        let secs = ts_ms / 1000;
+        let millis = ts_ms % 1000;
+        let timestamp = format!("{}.{:03}Z", secs, millis);
+        Some(AiAlertNotification {
+            timestamp,
+            level: level.to_string(),
+            reason,
+            event_kind: event.kind.clone(),
+            event_action: event.action.clone(),
+            pid: event.pid,
+            comm: event.comm.clone(),
+            detail: event.detail.clone(),
+        })
+    } else {
+        None
     }
 }
 
@@ -3053,6 +3176,10 @@ async fn run_http_server(shared: Shared, addr: String) -> Result<()> {
         .route("/api/v1/process/{pid}", get(api_process_detail))
         .route("/api/v1/upload-lib", post(api_upload_lib))
         .route("/api/v1/reload-hotpatch", post(api_reload_hotpatch))
+        // AI Analysis System
+        .route("/api/v1/ai/config", get(api_ai_get_config).post(api_ai_update_config))
+        .route("/api/v1/ai/chat", post(api_ai_chat))
+        .route("/api/v1/ai/events", get(api_ai_events))
         .with_state(shared)
         .layer(cors)
         .fallback(embedded_webui_handler);
@@ -3579,4 +3706,388 @@ async fn persist_policy(shared: &Shared) {
         }
         Err(err) => warn!("failed to serialize config: {err:#}"),
     }
+}
+
+// ── AI Analysis System ──
+
+/// Derive the AI config file path from the main config path.
+/// e.g. "gaia.toml" → "gaia-ai.toml"
+fn ai_config_path(config_path: &Path) -> PathBuf {
+    let stem = config_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("gaia");
+    let ext = config_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("toml");
+    let parent = config_path.parent().unwrap_or(Path::new("."));
+    parent.join(format!("{stem}-ai.{ext}"))
+}
+
+fn load_ai_config(config_path: &Path) -> AiConfig {
+    let path = ai_config_path(config_path);
+    if !path.exists() {
+        return AiConfig::default();
+    }
+    match fs::read_to_string(&path) {
+        Ok(raw) => toml::from_str::<AiConfig>(&raw).unwrap_or_default(),
+        Err(_) => AiConfig::default(),
+    }
+}
+
+async fn persist_ai_config(shared: &Shared) {
+    let cfg = shared.ai_config.read().await;
+    let path = ai_config_path(&shared.config_path);
+    match toml::to_string_pretty(&*cfg) {
+        Ok(content) => {
+            if let Err(err) = fs::write(&path, content) {
+                warn!("failed to persist AI config to {}: {err:#}", path.display());
+            } else {
+                info!("AI config persisted to {}", path.display());
+            }
+        }
+        Err(err) => warn!("failed to serialize AI config: {err:#}"),
+    }
+}
+
+// ── AI Config API ──
+
+async fn api_ai_get_config(State(shared): State<Shared>) -> Json<AiConfig> {
+    let cfg = shared.ai_config.read().await;
+    // Never expose the raw API key over the wire — return a masked version.
+    let mut safe = cfg.clone();
+    if !safe.api_key.is_empty() {
+        safe.api_key = "••••••••".to_string();
+    }
+    Json(safe)
+}
+
+#[derive(Debug, Deserialize)]
+struct AiConfigUpdate {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    provider: Option<AiProvider>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    /// If present and non-empty, replaces the stored key.
+    /// If present and empty, clears the key.
+    /// If absent (null), the key is left unchanged.
+    #[serde(default)]
+    api_key: Option<String>,
+}
+
+async fn api_ai_update_config(
+    State(shared): State<Shared>,
+    Json(update): Json<AiConfigUpdate>,
+) -> Json<AiConfig> {
+    let mut cfg = shared.ai_config.write().await;
+    if let Some(v) = update.enabled { cfg.enabled = v; }
+    if let Some(v) = update.provider { cfg.provider = v; }
+    if let Some(v) = update.base_url { cfg.base_url = v; }
+    if let Some(v) = update.model { cfg.model = v; }
+    if let Some(v) = update.api_key {
+        // Only update if the client sent a real key (not the masked placeholder).
+        if v != "••••••••" {
+            cfg.api_key = v;
+        }
+    }
+    let mut safe = cfg.clone();
+    drop(cfg);
+    persist_ai_config(&shared).await;
+    if !safe.api_key.is_empty() {
+        safe.api_key = "••••••••".to_string();
+    }
+    Json(safe)
+}
+
+// ── AI Chat API ──
+
+/// A single message in the chat history.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ChatMessage {
+    role: String,   // "user" | "assistant" | "system"
+    content: String,
+}
+
+/// Request body for /api/v1/ai/chat.
+#[derive(Debug, Deserialize)]
+struct AiChatRequest {
+    /// Conversation history (including the latest user message at the end).
+    messages: Vec<ChatMessage>,
+    /// If true, include recent security events as system context.
+    #[serde(default = "default_true")]
+    include_context: bool,
+}
+
+/// Build the system prompt with current security context.
+async fn build_system_prompt(shared: &Shared, include_context: bool) -> String {
+    let base = "You are GAIA, an AI security analyst embedded in the GAIA eBPF-based security \
+monitoring platform. You help operators understand security events, analyze anomalies, \
+investigate alerts, and suggest remediation steps. Be concise, technical, and actionable. \
+When referencing events, cite specific PIDs, process names, and timestamps where available.";
+
+    if !include_context {
+        return base.to_string();
+    }
+
+    let state = shared.runtime.read().await;
+    let recent_events: Vec<String> = state
+        .events
+        .iter()
+        .take(AI_CONTEXT_EVENTS)
+        .map(|e| {
+            format!(
+                "[{}] kind={} action={} pid={} comm={} detail={}{}",
+                e.timestamp_ns / 1_000_000,
+                e.kind,
+                e.action,
+                e.pid,
+                e.comm,
+                e.detail,
+                e.service
+                    .as_ref()
+                    .map(|s| format!(" service={s}"))
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+
+    let recent_alerts: Vec<String> = state
+        .alerts
+        .iter()
+        .take(10)
+        .map(|a| format!("[{}] {}: {}", a.level.to_uppercase(), a.event.comm, a.reason))
+        .collect();
+
+    let counters: Vec<String> = state
+        .counters
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+
+    drop(state);
+
+    format!(
+        "{base}\n\n\
+        ## Current System State\n\
+        Event counters (cumulative): {}\n\n\
+        ## Recent Alerts (newest first)\n{}\n\n\
+        ## Recent Events (newest first)\n{}",
+        counters.join(", "),
+        if recent_alerts.is_empty() { "None".to_string() } else { recent_alerts.join("\n") },
+        if recent_events.is_empty() { "None".to_string() } else { recent_events.join("\n") },
+    )
+}
+
+/// Resolve the effective API base URL for the given provider.
+fn resolve_base_url(cfg: &AiConfig) -> String {
+    if !cfg.base_url.is_empty() {
+        return cfg.base_url.trim_end_matches('/').to_string();
+    }
+    match cfg.provider {
+        AiProvider::Ollama => "http://localhost:11434".to_string(),
+        AiProvider::OpenAi | AiProvider::Custom => "https://api.openai.com".to_string(),
+    }
+}
+
+/// POST /api/v1/ai/chat — streams the LLM response as SSE.
+async fn api_ai_chat(
+    State(shared): State<Shared>,
+    Json(req): Json<AiChatRequest>,
+) -> Response {
+    let cfg = {
+        let guard = shared.ai_config.read().await;
+        guard.clone()
+    };
+
+    if !cfg.enabled {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AI analysis is disabled. Enable it in Settings → AI Analysis.",
+        )
+            .into_response();
+    }
+
+    let system_prompt = build_system_prompt(&shared, req.include_context).await;
+
+    // Build the full message list with system prompt prepended.
+    let mut messages: Vec<serde_json::Value> = vec![serde_json::json!({
+        "role": "system",
+        "content": system_prompt,
+    })];
+    for msg in &req.messages {
+        messages.push(serde_json::json!({
+            "role": msg.role,
+            "content": msg.content,
+        }));
+    }
+
+    let base_url = resolve_base_url(&cfg);
+    // Determine the chat completions endpoint based on provider.
+    let endpoint = match cfg.provider {
+        AiProvider::Ollama => format!("{base_url}/api/chat"),
+        _ => format!("{base_url}/v1/chat/completions"),
+    };
+
+    // Build the request body.
+    let body = match cfg.provider {
+        AiProvider::Ollama => serde_json::json!({
+            "model": cfg.model,
+            "messages": messages,
+            "stream": true,
+        }),
+        _ => serde_json::json!({
+            "model": cfg.model,
+            "messages": messages,
+            "stream": true,
+        }),
+    };
+
+    // Use reqwest to call the LLM API and stream the response back as SSE.
+    let client = reqwest::Client::new();
+    let mut req_builder = client
+        .post(&endpoint)
+        .header("Content-Type", "application/json")
+        .json(&body);
+
+    if !cfg.api_key.is_empty() {
+        req_builder = req_builder.header("Authorization", format!("Bearer {}", cfg.api_key));
+    }
+
+    let http_resp = match req_builder.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("LLM API request failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    if !http_resp.status().is_success() {
+        let status = http_resp.status();
+        let body_text = http_resp.text().await.unwrap_or_default();
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!("LLM API error {status}: {body_text}"),
+        )
+            .into_response();
+    }
+
+    let is_ollama = cfg.provider == AiProvider::Ollama;
+
+    // Use a tokio channel to bridge the reqwest byte stream into an SSE stream.
+    // This avoids StreamExt trait ambiguity inside async_stream macros.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
+
+    tokio::spawn(async move {
+        let mut byte_stream = http_resp.bytes_stream();
+        let mut buffer = String::new();
+
+        while let Some(chunk) = futures_util::StreamExt::next(&mut byte_stream).await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(Ok(
+                        Event::default().data(
+                            serde_json::json!({"error": e.to_string()}).to_string()
+                        )
+                    )).await;
+                    return;
+                }
+            };
+
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            // Process complete lines from the buffer.
+            while let Some(newline_pos) = buffer.find('\n') {
+                let line = buffer[..newline_pos].trim().to_string();
+                buffer = buffer[newline_pos + 1..].to_string();
+
+                if line.is_empty() || line == "data: [DONE]" {
+                    continue;
+                }
+
+                // Strip "data: " prefix (OpenAI SSE format).
+                let json_str = if line.starts_with("data: ") {
+                    &line[6..]
+                } else {
+                    &line
+                };
+
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    let (delta, done) = if is_ollama {
+                        // Ollama format: { "message": { "content": "..." }, "done": bool }
+                        let content = val["message"]["content"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
+                        let done = val["done"].as_bool().unwrap_or(false);
+                        (content, done)
+                    } else {
+                        // OpenAI format: { "choices": [{ "delta": { "content": "..." }, "finish_reason": ... }] }
+                        let content = val["choices"][0]["delta"]["content"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string();
+                        let done = val["choices"][0]["finish_reason"]
+                            .as_str()
+                            .map(|r| r == "stop")
+                            .unwrap_or(false);
+                        (content, done)
+                    };
+
+                    if !delta.is_empty() || done {
+                        let payload = serde_json::json!({
+                            "delta": delta,
+                            "done": done,
+                        });
+                        if tx.send(Ok(Event::default().data(payload.to_string()))).await.is_err() {
+                            return; // client disconnected
+                        }
+                    }
+                }
+            }
+        }
+
+        // Signal completion.
+        let _ = tx.send(Ok(
+            Event::default().data(
+                serde_json::json!({"delta": "", "done": true}).to_string()
+            )
+        )).await;
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+// ── AI Alert Event Stream (SSE) ──
+
+/// GET /api/v1/ai/events — SSE stream of high/critical alert notifications.
+/// Clients subscribe to receive real-time push notifications when dangerous
+/// events occur (hotpatch triggered, blocked port, privilege escalation, etc.).
+async fn api_ai_events(State(shared): State<Shared>) -> Response {
+    let rx = shared.ai_alert_tx.subscribe();
+    let stream = TokioStreamExt::filter_map(BroadcastStream::new(rx), |result| {
+        match result {
+            Ok(notification) => {
+                let data = serde_json::to_string(&notification).unwrap_or_default();
+                Some(Ok::<Event, Infallible>(Event::default().event("alert").data(data)))
+            }
+            // Lagged (missed some messages) — skip silently.
+            Err(_) => None,
+        }
+    });
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }

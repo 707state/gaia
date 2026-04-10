@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 
 // ── Types ──
@@ -115,8 +115,48 @@ type MonitorPolicy = {
   rate_limit_rules: RateLimitRule[]
 }
 
-type Tab = 'overview' | 'file' | 'process' | 'network' | 'hotpatch' | 'alerts' | 'config'
+type Tab = 'overview' | 'file' | 'process' | 'network' | 'hotpatch' | 'alerts' | 'config' | 'ai'
 type Lang = 'zh' | 'en'
+
+// ── AI Analysis Types ──
+
+type AiProvider = 'open_ai' | 'ollama' | 'custom'
+
+type AiConfig = {
+  enabled: boolean
+  provider: AiProvider
+  base_url: string
+  model: string
+  api_key: string
+}
+
+type ChatRole = 'user' | 'assistant' | 'system'
+
+type ChatMessage = {
+  role: ChatRole
+  content: string
+}
+
+/** A message in the UI chat history (may be a system notification or LLM response). */
+type UiChatMessage = {
+  id: string
+  role: ChatRole | 'alert'  // 'alert' = auto-pushed high-severity notification
+  content: string
+  streaming?: boolean
+  level?: string  // for alert messages: 'critical' | 'high'
+  timestamp: number
+}
+
+type AiAlertNotification = {
+  timestamp: string
+  level: string
+  reason: string
+  event_kind: string
+  event_action: string
+  pid: number
+  comm: string
+  detail: string
+}
 
 // ── Mock data ──
 
@@ -314,6 +354,7 @@ const tabDefs: { key: Tab; zh: string; en: string; icon: string }[] = [
   { key: 'network', zh: '网络监控', en: 'Network', icon: '🌐' },
   { key: 'hotpatch', zh: '热补丁', en: 'Hotpatch', icon: '🔥' },
   { key: 'alerts', zh: '告警中心', en: 'Alerts', icon: '🚨' },
+  { key: 'ai', zh: 'AI 分析', en: 'AI Analysis', icon: '🤖' },
   { key: 'config', zh: '系统配置', en: 'Config', icon: '⚡' },
 ]
 
@@ -423,6 +464,7 @@ function App() {
           {tab === 'network' && <NetworkTab snapshot={snapshot} lang={lang} tr={tr} />}
           {tab === 'hotpatch' && <HotpatchTab snapshot={snapshot} lang={lang} tr={tr} />}
           {tab === 'alerts' && <AlertsTab snapshot={snapshot} lang={lang} tr={tr} />}
+          {tab === 'ai' && <AiTab lang={lang} tr={tr} />}
           {tab === 'config' && <ConfigTab lang={lang} tr={tr} />}
         </div>
       </main>
@@ -1066,6 +1108,438 @@ function AlertsTab({ snapshot, lang, tr }: {
   )
 }
 
+// ── AI Analysis Tab ──
+
+let _aiMsgCounter = 0
+function aiMsgId() { return `ai-${++_aiMsgCounter}-${Date.now()}` }
+
+// ── Alert Panel (collapsible floating panel) ──────────────────────────────────
+function AiAlertPanel({ alerts, onClear, tr }: {
+  alerts: UiChatMessage[]
+  onClear: () => void
+  tr: (zh: string, en: string) => string
+}) {
+  const [collapsed, setCollapsed] = useState(false)
+  const [minimized, setMinimized] = useState(false)
+  const alertsEndRef = useRef<HTMLDivElement>(null)
+
+  // Auto-scroll alert list when new alerts arrive (only when expanded)
+  useEffect(() => {
+    if (!collapsed && !minimized) {
+      alertsEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
+  }, [alerts, collapsed, minimized])
+
+  const unread = alerts.length
+  const criticalCount = alerts.filter(a => a.level === 'critical').length
+  const highCount = alerts.filter(a => a.level === 'high').length
+
+  // Simple markdown-like rendering (same as AiChatBubble)
+  const renderContent = (text: string) => {
+    const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g)
+    return parts.map((part, i) => {
+      if (part.startsWith('`') && part.endsWith('`')) {
+        return <code key={i} className="ai-inline-code">{part.slice(1, -1)}</code>
+      }
+      if (part.startsWith('**') && part.endsWith('**')) {
+        return <strong key={i}>{part.slice(2, -2)}</strong>
+      }
+      return <span key={i}>{part.split('\n').map((line, j, arr) => (
+        <span key={j}>{line}{j < arr.length - 1 ? <br /> : null}</span>
+      ))}</span>
+    })
+  }
+
+  return (
+    <div className={`ai-alert-panel ${minimized ? 'minimized' : ''} ${collapsed ? 'collapsed' : ''}`}>
+      {/* Panel header — always visible */}
+      <div className="ai-alert-panel-header">
+        <div className="ai-alert-panel-title">
+          <span className="ai-alert-panel-icon">🚨</span>
+          {!collapsed && <span>{tr('实时告警', 'Live Alerts')}</span>}
+          {!collapsed && criticalCount > 0 && (
+            <span className="ai-alert-panel-badge critical">{criticalCount} {tr('严重', 'CRIT')}</span>
+          )}
+          {!collapsed && highCount > 0 && criticalCount === 0 && (
+            <span className="ai-alert-panel-badge high">{highCount} {tr('高危', 'HIGH')}</span>
+          )}
+          {!collapsed && unread > 0 && criticalCount === 0 && highCount === 0 && (
+            <span className="ai-alert-panel-badge high">{unread}</span>
+          )}
+          {collapsed && unread > 0 && (
+            <span className={`ai-alert-panel-badge ${criticalCount > 0 ? 'critical' : 'high'}`}>
+              {unread}
+            </span>
+          )}
+        </div>
+        <div className="ai-alert-panel-actions">
+          {!collapsed && alerts.length > 0 && (
+            <button className="ai-alert-panel-btn" onClick={onClear} title={tr('清空告警', 'Clear alerts')}>
+              ✕
+            </button>
+          )}
+          {!collapsed && (
+            <button
+              className="ai-alert-panel-btn"
+              onClick={() => setMinimized(m => !m)}
+              title={minimized ? tr('展开', 'Expand') : tr('最小化', 'Minimize')}
+            >
+              {minimized ? '▲' : '▼'}
+            </button>
+          )}
+          <button
+            className="ai-alert-panel-btn collapse-btn"
+            onClick={() => setCollapsed(c => !c)}
+            title={collapsed ? tr('展开面板', 'Expand panel') : tr('收起面板', 'Collapse panel')}
+          >
+            {collapsed ? '◀' : '▶'}
+          </button>
+        </div>
+      </div>
+
+      {/* Panel body — hidden when collapsed or minimized */}
+      {!collapsed && !minimized && (
+        <div className="ai-alert-panel-body">
+          {alerts.length === 0 ? (
+            <div className="ai-alert-panel-empty">
+              {tr('暂无告警', 'No alerts yet')}
+            </div>
+          ) : (
+            alerts.map(msg => (
+              <div key={msg.id} className={`ai-alert-bubble ${msg.level === 'critical' ? 'critical' : 'high'}`}>
+                <div className="ai-alert-header">
+                  <span className="ai-alert-badge">{msg.level === 'critical' ? '🔴 CRITICAL' : '🟠 HIGH'}</span>
+                  <span className="ai-alert-time">{new Date(msg.timestamp).toLocaleTimeString()}</span>
+                </div>
+                <div className="ai-alert-content">{renderContent(msg.content)}</div>
+              </div>
+            ))
+          )}
+          <div ref={alertsEndRef} />
+        </div>
+      )}
+    </div>
+  )
+}
+
+function AiTab({ lang, tr }: { lang: Lang; tr: (zh: string, en: string) => string }) {
+  const [aiConfig, setAiConfig] = useState<AiConfig | null>(null)
+  const [configLoading, setConfigLoading] = useState(true)
+  // Chat messages (user + assistant only)
+  const [messages, setMessages] = useState<UiChatMessage[]>([])
+  // Alerts are kept separate so they never pollute the chat
+  const [alerts, setAlerts] = useState<UiChatMessage[]>([])
+  const [input, setInput] = useState('')
+  const [sending, setSending] = useState(false)
+  const [includeContext, setIncludeContext] = useState(true)
+  const messagesEndRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+  const eventSourceRef = useRef<EventSource | null>(null)
+
+  // Load AI config
+  useEffect(() => {
+    fetch('/api/v1/ai/config')
+      .then(r => r.ok ? r.json() : null)
+      .then((cfg: AiConfig | null) => { if (cfg) setAiConfig(cfg) })
+      .catch(() => {})
+      .finally(() => setConfigLoading(false))
+  }, [])
+
+  // Subscribe to AI alert event stream — alerts go into separate state
+  useEffect(() => {
+    const es = new EventSource('/api/v1/ai/events')
+    eventSourceRef.current = es
+
+    es.addEventListener('alert', (e: MessageEvent) => {
+      try {
+        const notification = JSON.parse(e.data) as AiAlertNotification
+        const content = lang === 'zh'
+          ? `🚨 **[${notification.level.toUpperCase()}]** ${notification.reason}\n进程: \`${notification.comm}\` (PID ${notification.pid}) · 类型: ${notification.event_kind} · 详情: ${notification.detail}`
+          : `🚨 **[${notification.level.toUpperCase()}]** ${notification.reason}\nProcess: \`${notification.comm}\` (PID ${notification.pid}) · Kind: ${notification.event_kind} · Detail: ${notification.detail}`
+        setAlerts(prev => [...prev, {
+          id: aiMsgId(),
+          role: 'alert',
+          content,
+          level: notification.level,
+          timestamp: Date.now(),
+        }])
+      } catch { /* ignore parse errors */ }
+    })
+
+    es.onerror = () => {
+      // EventSource auto-reconnects; no action needed
+    }
+
+    return () => { es.close(); eventSourceRef.current = null }
+  }, [lang])
+
+  // Auto-scroll chat to bottom when new messages arrive
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages])
+
+
+  const sendMessage = async () => {
+    const text = input.trim()
+    if (!text || sending) return
+
+    const userMsg: UiChatMessage = {
+      id: aiMsgId(),
+      role: 'user',
+      content: text,
+      timestamp: Date.now(),
+    }
+    setMessages(prev => [...prev, userMsg])
+    setInput('')
+    setSending(true)
+
+    // Build conversation history
+    const history: ChatMessage[] = messages
+      .filter(m => m.role === 'user' || m.role === 'assistant')
+      .map(m => ({ role: m.role as ChatRole, content: m.content }))
+    history.push({ role: 'user', content: text })
+
+    // Add a placeholder streaming message
+    const assistantId = aiMsgId()
+    setMessages(prev => [...prev, {
+      id: assistantId,
+      role: 'assistant',
+      content: '',
+      streaming: true,
+      timestamp: Date.now(),
+    }])
+
+    try {
+      const resp = await fetch('/api/v1/ai/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: history, include_context: includeContext }),
+      })
+
+      if (!resp.ok) {
+        const errText = await resp.text()
+        setMessages(prev => prev.map(m =>
+          m.id === assistantId
+            ? { ...m, content: `❌ ${errText}`, streaming: false }
+            : m
+        ))
+        setSending(false)
+        return
+      }
+
+      // Read SSE stream
+      const reader = resp.body!.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let accumulated = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() ?? ''
+
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (!trimmed || !trimmed.startsWith('data:')) continue
+          const jsonStr = trimmed.slice(5).trim()
+          try {
+            const payload = JSON.parse(jsonStr) as { delta: string; done: boolean; error?: string }
+            if (payload.error) {
+              accumulated += `\n❌ ${payload.error}`
+            } else {
+              accumulated += payload.delta
+            }
+            setMessages(prev => prev.map(m =>
+              m.id === assistantId
+                ? { ...m, content: accumulated, streaming: !payload.done }
+                : m
+            ))
+            if (payload.done) break
+          } catch { /* skip malformed */ }
+        }
+      }
+    } catch (err) {
+      setMessages(prev => prev.map(m =>
+        m.id === assistantId
+          ? { ...m, content: `❌ ${tr('网络错误', 'Network error')}: ${err}`, streaming: false }
+          : m
+      ))
+    }
+
+    setSending(false)
+    inputRef.current?.focus()
+  }
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      sendMessage()
+    }
+  }
+
+  const clearHistory = () => {
+    setMessages([])
+  }
+
+  if (configLoading) {
+    return <div className="tab-content"><div className="empty-state">{tr('加载中...', 'Loading...')}</div></div>
+  }
+
+  const isEnabled = aiConfig?.enabled ?? false
+
+  return (
+    <div className="tab-content ai-tab">
+      {/* Status bar */}
+      <div className="ai-status-bar">
+        <div className="ai-status-left">
+          <span className={`ai-status-dot ${isEnabled ? 'enabled' : 'disabled'}`} />
+          <span className="ai-status-label">
+            {isEnabled
+              ? tr(`AI 分析已启用 · ${aiConfig?.model ?? ''}`, `AI Analysis Enabled · ${aiConfig?.model ?? ''}`)
+              : tr('AI 分析未启用 — 请在「系统配置」中开启', 'AI Analysis disabled — enable it in Config')}
+          </span>
+        </div>
+        <div className="ai-status-right">
+          <label className="ai-ctx-toggle">
+            <input
+              type="checkbox"
+              checked={includeContext}
+              onChange={e => setIncludeContext(e.target.checked)}
+            />
+            <span>{tr('携带系统上下文', 'Include system context')}</span>
+          </label>
+          {messages.length > 0 && (
+            <button className="btn-ghost-sm" onClick={clearHistory}>
+              {tr('清空对话', 'Clear')}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Main area: chat + alert panel side by side */}
+      <div className="ai-main-area">
+        {/* Chat messages — pure conversation, no alerts */}
+        <div className="ai-chat-body">
+          {messages.length === 0 && (
+            <div className="ai-welcome">
+              <div className="ai-welcome-icon">🤖</div>
+              <h3>{tr('GAIA AI 安全分析助手', 'GAIA AI Security Analyst')}</h3>
+              <p>{tr(
+                '你好！我是 GAIA 的 AI 安全分析助手。我可以帮你分析安全事件、解读告警、排查异常行为，并提供修复建议。',
+                'Hello! I\'m GAIA\'s AI security analyst. I can help you analyze security events, interpret alerts, investigate anomalies, and suggest remediation steps.'
+              )}</p>
+              <div className="ai-suggestions">
+                {[
+                  [tr('分析最近的告警', 'Analyze recent alerts'), tr('分析最近的告警', 'Analyze recent alerts')],
+                  [tr('有哪些高危进程？', 'Any high-risk processes?'), tr('有哪些高危进程？', 'Any high-risk processes?')],
+                  [tr('解释热补丁触发事件', 'Explain hotpatch trigger events'), tr('解释热补丁触发事件', 'Explain hotpatch trigger events')],
+                  [tr('当前系统安全状态如何？', 'What is the current security posture?'), tr('当前系统安全状态如何？', 'What is the current security posture?')],
+                ].map(([label, prompt], i) => (
+                  <button
+                    key={i}
+                    className="ai-suggestion-chip"
+                    onClick={() => { setInput(prompt); inputRef.current?.focus() }}
+                    disabled={!isEnabled}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {messages.map(msg => (
+            <AiChatBubble key={msg.id} msg={msg} tr={tr} />
+          ))}
+          <div ref={messagesEndRef} />
+        </div>
+
+        {/* Collapsible alert panel — floats on the right */}
+        <AiAlertPanel alerts={alerts} onClear={() => setAlerts([])} tr={tr} />
+      </div>
+
+      {/* Input area */}
+      <div className="ai-input-area">
+        <textarea
+          ref={inputRef}
+          className="ai-input"
+          placeholder={isEnabled
+            ? tr('输入问题，按 Enter 发送，Shift+Enter 换行...', 'Ask a question, Enter to send, Shift+Enter for newline...')
+            : tr('请先在「系统配置」中启用 AI 分析功能', 'Enable AI Analysis in Config first')}
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyDown={handleKeyDown}
+          disabled={!isEnabled || sending}
+          rows={3}
+        />
+        <button
+          className={`ai-send-btn ${sending ? 'loading' : ''}`}
+          onClick={sendMessage}
+          disabled={!isEnabled || sending || !input.trim()}
+        >
+          {sending ? '⏳' : '➤'}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function AiChatBubble({ msg }: { msg: UiChatMessage; tr?: (zh: string, en: string) => string }) {
+  const isUser = msg.role === 'user'
+  const isAlert = msg.role === 'alert'
+  const isAssistant = msg.role === 'assistant'
+
+  // Simple markdown-like rendering: bold, code, newlines
+  const renderContent = (text: string) => {
+    const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g)
+    return parts.map((part, i) => {
+      if (part.startsWith('`') && part.endsWith('`')) {
+        return <code key={i} className="ai-inline-code">{part.slice(1, -1)}</code>
+      }
+      if (part.startsWith('**') && part.endsWith('**')) {
+        return <strong key={i}>{part.slice(2, -2)}</strong>
+      }
+      return <span key={i}>{part.split('\n').map((line, j, arr) => (
+        <span key={j}>{line}{j < arr.length - 1 ? <br /> : null}</span>
+      ))}</span>
+    })
+  }
+
+  if (isAlert) {
+    return (
+      <div className={`ai-alert-bubble ${msg.level === 'critical' ? 'critical' : 'high'}`}>
+        <div className="ai-alert-header">
+          <span className="ai-alert-badge">{msg.level === 'critical' ? '🔴 CRITICAL' : '🟠 HIGH'}</span>
+          <span className="ai-alert-time">{new Date(msg.timestamp).toLocaleTimeString()}</span>
+        </div>
+        <div className="ai-alert-content">{renderContent(msg.content)}</div>
+      </div>
+    )
+  }
+
+  return (
+    <div className={`ai-bubble-row ${isUser ? 'user' : 'assistant'}`}>
+      <div className={`ai-bubble ${isUser ? 'user' : 'assistant'} ${msg.streaming ? 'streaming' : ''}`}>
+        {isAssistant && (
+          <div className="ai-bubble-header">
+            <span className="ai-bubble-role">🤖 GAIA AI</span>
+            {msg.streaming && <span className="ai-typing-indicator"><span /><span /><span /></span>}
+          </div>
+        )}
+        <div className="ai-bubble-content">
+          {msg.content ? renderContent(msg.content) : (
+            msg.streaming ? <span className="ai-typing-indicator"><span /><span /><span /></span> : null
+          )}
+        </div>
+        <div className="ai-bubble-time">{new Date(msg.timestamp).toLocaleTimeString()}</div>
+      </div>
+    </div>
+  )
+}
+
 // ── Config Tab ──
 
 function ConfigTab({ lang, tr }: { lang: Lang; tr: (zh: string, en: string) => string }) {
@@ -1200,6 +1674,148 @@ function ConfigTab({ lang, tr }: { lang: Lang; tr: (zh: string, en: string) => s
       <BaselinePanel policy={policy} setPolicy={setPolicy} saving={saving} setSaving={setSaving} flash={flash} lang={lang} tr={tr} />
       <RateLimitPanel rules={policy.rate_limit_rules} setRules={r => setPolicy({ ...policy, rate_limit_rules: r })} toggle={toggle} flash={flash} tr={tr} />
       <HotpatchConfigPanel targets={policy.hotpatch.targets} setTargets={t => setPolicy({ ...policy, hotpatch: { targets: t } })} toggle={toggle} flash={flash} tr={tr} />
+      <AiConfigPanel lang={lang} tr={tr} flash={flash} />
+    </div>
+  )
+}
+
+// ── AI Config Panel (inside Config Tab) ──
+
+function AiConfigPanel({ tr, flash }: {
+  lang?: Lang
+  tr: (zh: string, en: string) => string
+  flash: (msg: string) => void
+}) {
+  const [cfg, setCfg] = useState<AiConfig | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    fetch('/api/v1/ai/config')
+      .then(r => r.ok ? r.json() : null)
+      .then((c: AiConfig | null) => { if (c) setCfg(c) })
+      .catch(() => {})
+      .finally(() => setLoading(false))
+  }, [])
+
+  const save = async (updates: Partial<AiConfig>) => {
+    if (!cfg) return
+    const next = { ...cfg, ...updates }
+    setCfg(next)
+    setSaving(true)
+    try {
+      const r = await fetch('/api/v1/ai/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updates),
+      })
+      if (r.ok) {
+        const updated = await r.json() as AiConfig
+        setCfg(updated)
+        flash(tr('AI 配置已保存', 'AI config saved'))
+      } else {
+        flash(tr('保存失败', 'Save failed'))
+      }
+    } catch { flash(tr('保存失败: 网络错误', 'Save failed: network error')) }
+    setSaving(false)
+  }
+
+  if (loading) return null
+  if (!cfg) return null
+
+  const providerLabels: Record<AiProvider, string> = {
+    open_ai: 'OpenAI / Compatible',
+    ollama: 'Ollama (Local)',
+    custom: 'Custom',
+  }
+
+  return (
+    <div className="card">
+      <div className="card-header">
+        <h3>🤖 {tr('AI 分析系统', 'AI Analysis System')}</h3>
+        <div className="header-actions">
+          <button
+            className={`switch ${cfg.enabled ? 'on' : 'off'}`}
+            onClick={() => save({ enabled: !cfg.enabled })}
+            title={cfg.enabled ? tr('点击关闭 AI 分析', 'Click to disable AI') : tr('点击启用 AI 分析', 'Click to enable AI')}
+          >
+            <span className="switch-knob" />
+          </button>
+          <span className={`card-badge ${cfg.enabled ? '' : 'danger'}`}>
+            {cfg.enabled ? tr('已启用', 'Enabled') : tr('已禁用', 'Disabled')}
+          </span>
+        </div>
+      </div>
+      <p className="card-desc">{tr(
+        '集成 LLM 进行安全事件分析。启用后可在「AI 分析」标签页与 AI 交互，高危告警也会自动推送到 AI 聊天面板。',
+        'Integrate an LLM for security event analysis. When enabled, interact with AI in the "AI Analysis" tab. High-severity alerts are automatically pushed to the AI chat panel.'
+      )}</p>
+
+      {cfg.enabled && (
+        <div className="ai-config-form">
+          <div className="config-row">
+            <label>{tr('LLM 提供商', 'LLM Provider')}</label>
+            <select
+              value={cfg.provider}
+              onChange={e => save({ provider: e.target.value as AiProvider })}
+              disabled={saving}
+            >
+              {(Object.keys(providerLabels) as AiProvider[]).map(p => (
+                <option key={p} value={p}>{providerLabels[p]}</option>
+              ))}
+            </select>
+          </div>
+
+          <div className="config-row">
+            <label>{tr('模型名称', 'Model Name')}</label>
+            <input
+              type="text"
+              value={cfg.model}
+              placeholder={cfg.provider === 'ollama' ? 'llama3.2' : 'gpt-4o-mini'}
+              onChange={e => setCfg({ ...cfg, model: e.target.value })}
+              onBlur={e => save({ model: e.target.value })}
+              disabled={saving}
+            />
+          </div>
+
+          <div className="config-row">
+            <label>
+              {cfg.provider === 'ollama'
+                ? tr('Ollama 地址', 'Ollama Base URL')
+                : tr('API Base URL', 'API Base URL')}
+            </label>
+            <input
+              type="text"
+              value={cfg.base_url}
+              placeholder={cfg.provider === 'ollama' ? 'http://localhost:11434' : 'https://api.openai.com'}
+              onChange={e => setCfg({ ...cfg, base_url: e.target.value })}
+              onBlur={e => save({ base_url: e.target.value })}
+              disabled={saving}
+            />
+          </div>
+
+          {cfg.provider !== 'ollama' && (
+            <div className="config-row">
+              <label>{tr('API Key', 'API Key')}</label>
+              <input
+                type="password"
+                value={cfg.api_key}
+                placeholder={tr('sk-... (留空则不发送)', 'sk-... (leave empty to skip)')}
+                onChange={e => setCfg({ ...cfg, api_key: e.target.value })}
+                onBlur={e => save({ api_key: e.target.value })}
+                disabled={saving}
+                autoComplete="off"
+              />
+            </div>
+          )}
+
+          <div className="ai-config-hint">
+            {cfg.provider === 'ollama'
+              ? tr('Ollama 本地模型无需 API Key，确保 Ollama 服务已启动并已拉取对应模型。', 'Ollama local models require no API key. Ensure Ollama is running and the model is pulled.')
+              : tr('API Key 仅存储在服务端配置文件中，不会在前端明文显示。', 'API Key is stored only in the server-side config file and never shown in plaintext in the UI.')}
+          </div>
+        </div>
+      )}
     </div>
   )
 }
