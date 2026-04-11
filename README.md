@@ -76,6 +76,7 @@
 | OpenEuler | 22.03 LTS (内核 5.10+) | 需开启 `CONFIG_DEBUG_INFO_BTF=y` |
 | Rust 工具链 | 1.75.0 (stable) | 含 `rustup` |
 | Rust nightly | nightly-2024-01-01+ | 用于编译 eBPF 内核程序 |
+| pnpm | 9+ | 用于构建 `gaia-webui`，已集成到 `cargo build` |
 | bpftool | 5.10+ | 用于 BTF 对象生成（可选） |
 | Linux 内核头文件 | 与运行内核一致 | 仅开发环境需要 |
 
@@ -96,13 +97,19 @@ cargo install cargo-generate
 # 安装 bpf-linker（eBPF 程序链接器）
 cargo install bpf-linker
 
+# 安装 pnpm（前端构建工具，cargo build 会自动调用）
+npm install -g pnpm
+
 ```
 
 ## 从源码构建
 
 ```bash
-cargo build //编译
+# 在项目根目录执行；会自动触发 gaia-webui 的 pnpm build
+cargo build
 ```
+
+> 构建前请确认系统中已安装 `pnpm`，并且 `gaia-webui` 依赖已经准备好。
 
 ## 运行
 
@@ -151,5 +158,4 @@ sudo RUST_LOG=info ./target/debug/gaia-xdp --config gaia.toml
 │                     OpenEuler 内核 (5.10+)                           │
 │         BTF/CO-RE  │  BPF LSM  │  systemd DBus  │  ARM64 支持        │
 └──────────────────────────────────────────────────────────────────────┘
-
 
