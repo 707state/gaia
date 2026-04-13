@@ -170,6 +170,70 @@ export type UiChatMessage = {
   timestamp: number
 }
 
+export type FileMetadata = {
+  path: string
+  file_type: string
+  size_bytes: number
+  permissions: string
+  owner_uid: number
+  owner_gid: number
+  inode: number
+  hard_links: number
+  modified_secs: number
+  accessed_secs: number
+  created_secs: number
+}
+
+export type FileEventDetail = {
+  summary: string
+  action_meaning: string
+  is_sensitive: boolean
+  file_meta: FileMetadata | null
+  currently_open_by_pid: boolean
+}
+
+export type StoredEvent = {
+  id: number
+  ts_ms: number
+  kind: string
+  action: string
+  pid: number
+  tgid: number
+  uid: number
+  gid: number
+  comm: string
+  detail: string
+  service?: string
+  net_addr?: string
+  net_port?: number
+}
+
+export type EventPage = {
+  events: StoredEvent[]
+  total: number
+  page: number
+  page_size: number
+}
+
+/** Adapt a StoredEvent (from history API) to the EventRecord shape used by modals. */
+export function storedToEventRecord(e: StoredEvent): EventRecord {
+  return {
+    timestamp_ns: e.ts_ms,
+    kind: e.kind,
+    action: e.action,
+    pid: e.pid,
+    tgid: e.tgid,
+    uid: e.uid,
+    gid: e.gid,
+    comm: e.comm,
+    detail: e.detail,
+    service: e.service,
+    network: e.net_addr != null && e.net_port != null
+      ? { address: e.net_addr, port: e.net_port }
+      : undefined,
+  }
+}
+
 export type AiAlertNotification = {
   timestamp: string
   level: string

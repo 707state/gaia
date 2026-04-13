@@ -13,15 +13,21 @@ import {
 } from './app/components/ConfigPanels'
 import {
   AlertList,
+  EventDetailModal,
   EventTable,
+  FileEventDetailModal,
+  HistoryPanel,
   ProcessDetailModal,
   ToggleListPanel,
 } from './app/components/SharedPanels'
 import type {
   AiAlertNotification,
   AiConfig,
+  AlertRecord,
   ChatMessage,
   ChatRole,
+  EventRecord,
+  FileEventDetail,
   Lang,
   MonitorPolicy,
   ProcessDetail,
@@ -29,6 +35,7 @@ import type {
   Tab,
   UiChatMessage,
 } from './app/types'
+import { storedToEventRecord } from './app/types'
 import {
   formatTimestamp,
   initialLang,
@@ -139,7 +146,7 @@ function App() {
         <div className="content-body">
           {tab === 'overview' && <OverviewTab snapshot={snapshot} totalEvents={totalEvents} lang={lang} tr={tr} onPidClick={openProcessDetail} />}
           {tab === 'file' && <FileTab snapshot={snapshot} lang={lang} tr={tr} />}
-          {tab === 'process' && <ProcessTab snapshot={snapshot} lang={lang} tr={tr} />}
+          {tab === 'process' && <ProcessTab snapshot={snapshot} lang={lang} tr={tr} onPidClick={openProcessDetail} />}
           {tab === 'network' && <NetworkTab snapshot={snapshot} lang={lang} tr={tr} />}
           {tab === 'hotpatch' && <HotpatchTab snapshot={snapshot} lang={lang} tr={tr} />}
           {tab === 'alerts' && <AlertsTab snapshot={snapshot} lang={lang} tr={tr} />}
@@ -291,16 +298,55 @@ function OverviewTab({ snapshot, totalEvents, lang, tr, onPidClick }: {
 function FileTab({ snapshot, lang, tr }: {
   snapshot: Snapshot; lang: Lang; tr: (zh: string, en: string) => string
 }) {
+  const [selectedEvent, setSelectedEvent] = useState<EventRecord | null>(null)
+  const [selectedAlert, setSelectedAlert] = useState<AlertRecord | null>(null)
+  const [fileDetail, setFileDetail] = useState<FileEventDetail | null>(null)
+  const [fileDetailLoading, setFileDetailLoading] = useState(false)
+  const [eventsCollapsed, setEventsCollapsed] = useState(false)
+  const [historyDetailEvent, setHistoryDetailEvent] = useState<EventRecord | null>(null)
+
   const fileEvents = snapshot.events.filter(e => e.kind === 'file_io')
   const fileAlerts = snapshot.alerts.filter(a => a.event.kind === 'file_io')
   const sensitiveAccess = fileEvents.filter(e => e.action === 'alert').length
+
+  const fetchDetail = useCallback(async (event: EventRecord) => {
+    setFileDetail(null)
+    setFileDetailLoading(true)
+    try {
+      const params = new URLSearchParams({ path: event.detail })
+      if (event.pid) params.set('pid', String(event.pid))
+      const r = await fetch(`/api/v1/file-event/detail?${params}`)
+      if (r.ok) setFileDetail((await r.json()) as FileEventDetail)
+    } catch { /* ignore */ }
+    setFileDetailLoading(false)
+  }, [])
+
+  const openEventDetail = useCallback((event: EventRecord) => {
+    if (event.action !== 'enter' && event.action !== 'alert') return
+    setSelectedEvent(event)
+    setSelectedAlert(null)
+    fetchDetail(event)
+  }, [fetchDetail])
+
+  const openAlertDetail = useCallback((alert: AlertRecord) => {
+    setSelectedAlert(alert)
+    setSelectedEvent(alert.event)
+    fetchDetail(alert.event)
+  }, [fetchDetail])
+
+  const closeDetail = useCallback(() => {
+    setSelectedEvent(null)
+    setSelectedAlert(null)
+    setFileDetail(null)
+    setFileDetailLoading(false)
+  }, [])
 
   return (
     <div className="tab-content">
       <div className="tab-intro">
         <p>{tr(
-          '文件 I/O 代理通过 tracepoint/syscalls/sys_enter_openat 和 sys_exit_openat 挂载点，在内核态进行轻量级路径前缀匹配，仅将对敏感目标（如 /etc/shadow、SSL 证书、SSH 密钥等）的访问事件上报至用户态。',
-          'The File I/O Agent hooks into tracepoint/syscalls/sys_enter_openat and sys_exit_openat, performing lightweight path prefix matching in kernel space. Only access events targeting sensitive files (e.g., /etc/shadow, SSL certs, SSH keys) are forwarded to user space.'
+          '文件 I/O 代理通过 tracepoint/syscalls/sys_enter_openat 和 sys_exit_openat 挂载点，在内核态进行轻量级路径前缀匹配，仅将对敏感目标（如 /etc/shadow、SSL 证书、SSH 密钥等）的访问事件上报至用户态。点击事件行或告警项可查看详情。',
+          'The File I/O Agent hooks into tracepoint/syscalls/sys_enter_openat and sys_exit_openat, performing lightweight path prefix matching in kernel space. Only access events targeting sensitive files (e.g., /etc/shadow, SSL certs, SSH keys) are forwarded to user space. Click an event row or alert to inspect it.'
         )}</p>
       </div>
 
@@ -331,12 +377,25 @@ function FileTab({ snapshot, lang, tr }: {
       <div className="card">
         <div className="card-header">
           <h3>{tr('文件访问事件', 'File Access Events')}</h3>
-          <span className="card-badge">{tr('实时', 'Live')}</span>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <span className="card-badge">{tr('点击行查看详情', 'Click row for details')}</span>
+            <button
+              className="btn-collapse"
+              onClick={() => setEventsCollapsed(c => !c)}
+              title={eventsCollapsed ? tr('展开', 'Expand') : tr('收起', 'Collapse')}
+            >
+              {eventsCollapsed ? '▶' : '▼'}
+            </button>
+          </div>
         </div>
-        {fileEvents.length > 0 ? (
-          <EventTable events={fileEvents} lang={lang} tr={tr} />
-        ) : (
-          <div className="empty-state">{tr('暂无文件事件', 'No file events yet')}</div>
+        {!eventsCollapsed && (
+          fileEvents.length > 0 ? (
+            <div className="file-event-scroll">
+              <FileEventTable events={fileEvents} lang={lang} tr={tr} onEventClick={openEventDetail} />
+            </div>
+          ) : (
+            <div className="empty-state">{tr('暂无文件事件', 'No file events yet')}</div>
+          )
         )}
       </div>
 
@@ -344,10 +403,15 @@ function FileTab({ snapshot, lang, tr }: {
         <div className="card">
           <div className="card-header">
             <h3>{tr('文件相关告警', 'File-related Alerts')}</h3>
+            <span className="card-badge">{tr('点击告警查看详情', 'Click alert for details')}</span>
           </div>
-          <AlertList alerts={fileAlerts} lang={lang} />
+          <div className="file-alert-scroll">
+            <AlertList alerts={fileAlerts} lang={lang} onAlertClick={openAlertDetail} />
+          </div>
         </div>
       )}
+
+      <HistoryPanel kinds={['file_io']} lang={lang} tr={tr} onEventClick={e => setHistoryDetailEvent(storedToEventRecord(e))} />
 
       <div className="card">
         <div className="card-header">
@@ -364,15 +428,73 @@ function FileTab({ snapshot, lang, tr }: {
           </div>
         </div>
       </div>
+
+      <FileEventDetailModal
+        event={selectedEvent}
+        alertRecord={selectedAlert}
+        detail={fileDetail}
+        loading={fileDetailLoading}
+        lang={lang}
+        tr={tr}
+        onClose={closeDetail}
+      />
+      <EventDetailModal event={historyDetailEvent} lang={lang} tr={tr} onClose={() => setHistoryDetailEvent(null)} />
+    </div>
+  )
+}
+
+function FileEventTable({ events, lang, tr, onEventClick }: {
+  events: EventRecord[]
+  lang: Lang
+  tr: (zh: string, en: string) => string
+  onEventClick: (event: EventRecord) => void
+}) {
+  const isClickable = (e: EventRecord) => e.action === 'enter' || e.action === 'alert'
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>{tr('时间', 'Time')}</th>
+            <th>{tr('动作', 'Action')}</th>
+            <th>{tr('服务', 'Service')}</th>
+            <th>{tr('进程', 'Process')}</th>
+            <th>PID</th>
+            <th>UID</th>
+            <th>{tr('文件路径', 'File Path')}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {events.map((e, i) => (
+            <tr
+              key={`${e.timestamp_ns}-${i}`}
+              className={`${e.action === 'blocked' ? 'row-blocked' : e.action === 'alert' ? 'row-alert' : e.action === 'rate_limited' ? 'row-rate-limited' : ''} ${isClickable(e) ? 'row-clickable' : ''}`}
+              onClick={() => isClickable(e) && onEventClick(e)}
+              title={isClickable(e) ? tr('点击查看事件详情', 'Click to inspect event') : undefined}
+            >
+              <td className="td-time">{formatTimestamp(e.timestamp_ns)}</td>
+              <td><span className={`action-tag action-${e.action}`}>{mapAction(e.action, lang)}</span></td>
+              <td>{e.service ? <span className="service-badge">{e.service}</span> : <span className="no-service">-</span>}</td>
+              <td><code>{e.comm || '-'}</code></td>
+              <td>{e.pid}</td>
+              <td>{e.uid}</td>
+              <td className="td-detail">{e.detail || '-'}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   )
 }
 
 // ── Process Tab ──
 
-function ProcessTab({ snapshot, lang, tr }: {
+function ProcessTab({ snapshot, lang, tr, onPidClick }: {
   snapshot: Snapshot; lang: Lang; tr: (zh: string, en: string) => string
+  onPidClick: (pid: number) => void
 }) {
+  const [detailEvent, setDetailEvent] = useState<EventRecord | null>(null)
+
   const processEvents = snapshot.events.filter(e => e.kind === 'process' || e.kind === 'privilege')
   const privEvents = snapshot.events.filter(e => e.kind === 'privilege')
   const processAlerts = snapshot.alerts.filter(a => a.event.kind === 'process' || a.event.kind === 'privilege')
@@ -381,8 +503,8 @@ function ProcessTab({ snapshot, lang, tr }: {
     <div className="tab-content">
       <div className="tab-intro">
         <p>{tr(
-          '进程与权限代理通过 tracepoint/syscalls/sys_enter_execve、setuid、setgid 挂载点，追踪进程树的生命周期，检测未经授权的特权提升行为。结合可执行文件白名单前缀校验，识别异常进程创建。',
-          'The Process & Privilege Agent hooks into tracepoint/syscalls/sys_enter_execve, setuid, and setgid to track process tree lifecycles and detect unauthorized privilege escalations. Combined with executable whitelist prefix validation, it identifies abnormal process creation.'
+          '进程与权限代理通过 tracepoint/syscalls/sys_enter_execve、setuid、setgid 挂载点，追踪进程树的生命周期，检测未经授权的特权提升行为。点击事件行可查看该进程的实时详情。',
+          'The Process & Privilege Agent hooks into sys_enter_execve, setuid, and setgid to track process lifecycles and detect privilege escalations. Click any event row to inspect the live process details.'
         )}</p>
       </div>
 
@@ -413,9 +535,10 @@ function ProcessTab({ snapshot, lang, tr }: {
       <div className="card">
         <div className="card-header">
           <h3>{tr('进程与权限事件', 'Process & Privilege Events')}</h3>
+          <span className="card-badge">{tr('点击行查看详情', 'Click row for details')}</span>
         </div>
         {processEvents.length > 0 ? (
-          <EventTable events={processEvents} lang={lang} tr={tr} />
+          <EventTable events={processEvents} lang={lang} tr={tr} onRowClick={setDetailEvent} />
         ) : (
           <div className="empty-state">{tr('暂无进程事件', 'No process events yet')}</div>
         )}
@@ -427,9 +550,11 @@ function ProcessTab({ snapshot, lang, tr }: {
             <h3>{tr('权限提升事件', 'Privilege Escalation Events')}</h3>
             <span className="card-badge danger">{privEvents.length}</span>
           </div>
-          <EventTable events={privEvents} lang={lang} tr={tr} />
+          <EventTable events={privEvents} lang={lang} tr={tr} onRowClick={setDetailEvent} />
         </div>
       )}
+
+      <HistoryPanel kinds={['process', 'privilege']} lang={lang} tr={tr} onPidClick={onPidClick} onEventClick={e => setDetailEvent(storedToEventRecord(e))} />
 
       <div className="card">
         <div className="card-header">
@@ -450,6 +575,8 @@ function ProcessTab({ snapshot, lang, tr }: {
           </div>
         </div>
       </div>
+
+      <EventDetailModal event={detailEvent} lang={lang} tr={tr} onClose={() => setDetailEvent(null)} />
     </div>
   )
 }
@@ -465,6 +592,8 @@ function formatBytes(bytes: number): string {
 function NetworkTab({ snapshot, lang, tr }: {
   snapshot: Snapshot; lang: Lang; tr: (zh: string, en: string) => string
 }) {
+  const [detailEvent, setDetailEvent] = useState<EventRecord | null>(null)
+
   const netEvents = snapshot.events.filter(e => e.kind === 'network')
   const blockedEvents = netEvents.filter(e => e.action === 'blocked')
   const netAlerts = snapshot.alerts.filter(a => a.event.kind === 'network')
@@ -548,7 +677,10 @@ function NetworkTab({ snapshot, lang, tr }: {
       <div className="card">
         <div className="card-header">
           <h3>{tr('网络事件流', 'Network Event Stream')}</h3>
-          <span className="card-badge">{tr('网络事件', 'Events')}: {(snapshot.counters.network ?? 0).toLocaleString()}</span>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <span className="card-badge">{tr('网络事件', 'Events')}: {(snapshot.counters.network ?? 0).toLocaleString()}</span>
+            <span className="card-badge">{tr('点击行查看详情', 'Click row for details')}</span>
+          </div>
         </div>
         {netEvents.length > 0 ? (
           <div className="table-wrap">
@@ -566,7 +698,12 @@ function NetworkTab({ snapshot, lang, tr }: {
               </thead>
               <tbody>
                 {netEvents.map((e, i) => (
-                  <tr key={`${e.timestamp_ns}-${i}`} className={e.action === 'blocked' ? 'row-blocked' : e.action === 'rate_limited' ? 'row-rate-limited' : ''}>
+                  <tr
+                    key={`${e.timestamp_ns}-${i}`}
+                    className={`${e.action === 'blocked' ? 'row-blocked' : e.action === 'rate_limited' ? 'row-rate-limited' : ''} row-clickable`}
+                    onClick={() => setDetailEvent(e)}
+                    title={tr('点击查看事件详情', 'Click to inspect event')}
+                  >
                     <td className="td-time">{formatTimestamp(e.timestamp_ns)}</td>
                     <td><span className={`action-tag action-${e.action}`}>{mapAction(e.action, lang)}</span></td>
                     <td><code>{e.comm}</code></td>
@@ -584,6 +721,8 @@ function NetworkTab({ snapshot, lang, tr }: {
         )}
       </div>
 
+      <HistoryPanel kinds={['network']} lang={lang} tr={tr} onEventClick={e => setDetailEvent(storedToEventRecord(e))} />
+
       <div className="card">
         <div className="card-header">
           <h3>{tr('挂载点详情', 'Hook Points')}</h3>
@@ -599,6 +738,8 @@ function NetworkTab({ snapshot, lang, tr }: {
           </div>
         </div>
       </div>
+
+      <EventDetailModal event={detailEvent} lang={lang} tr={tr} onClose={() => setDetailEvent(null)} />
     </div>
   )
 }
@@ -613,6 +754,7 @@ function HotpatchTab({ snapshot, lang, tr }: {
   const symbolOk = snapshot.features.symbol_resolver
   const [reloading, setReloading] = useState(false)
   const [reloadMsg, setReloadMsg] = useState('')
+  const [detailEvent, setDetailEvent] = useState<EventRecord | null>(null)
 
   const handleReload = async () => {
     setReloading(true)
@@ -669,16 +811,21 @@ function HotpatchTab({ snapshot, lang, tr }: {
       <div className="card">
         <div className="card-header">
           <h3>{tr('热补丁事件流', 'Hotpatch Event Stream')}</h3>
-          <button className="btn-reload" onClick={handleReload} disabled={reloading}>
-            {reloading ? tr('重载中...', 'Reloading...') : tr('重载探针', 'Reload Probes')}
-          </button>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <span className="card-badge">{tr('点击行查看详情', 'Click row for details')}</span>
+            <button className="btn-reload" onClick={handleReload} disabled={reloading}>
+              {reloading ? tr('重载中...', 'Reloading...') : tr('重载探针', 'Reload Probes')}
+            </button>
+          </div>
         </div>
         {hotpatchEvents.length > 0 ? (
-          <EventTable events={hotpatchEvents} lang={lang} tr={tr} />
+          <EventTable events={hotpatchEvents} lang={lang} tr={tr} onRowClick={setDetailEvent} />
         ) : (
           <div className="empty-state">{tr('暂无热补丁事件', 'No hotpatch events yet')}</div>
         )}
       </div>
+
+      <HistoryPanel kinds={['hotpatch']} lang={lang} tr={tr} onEventClick={e => setDetailEvent(storedToEventRecord(e))} />
 
       <div className="card">
         <div className="card-header">
@@ -717,6 +864,8 @@ function HotpatchTab({ snapshot, lang, tr }: {
           </div>
         </div>
       </div>
+
+      <EventDetailModal event={detailEvent} lang={lang} tr={tr} onClose={() => setDetailEvent(null)} />
     </div>
   )
 }

@@ -233,8 +233,8 @@ export function BaselinePanel({ policy, setPolicy, saving, setSaving, flash, lan
 
   return (
     <div className="card">
-      <div className="card-header"><h3>{tr('基线阈值（每 30 秒窗口）', 'Baseline Thresholds (per 30s window)')}</h3></div>
-      <p className="card-desc">{tr('超过阈值的系统调用频率将触发中危告警。', 'Syscall frequencies exceeding thresholds trigger medium-level alerts.')}</p>
+      <div className="card-header"><h3>{tr('基线阈值（每秒次数）', 'Baseline Thresholds (events/sec)')}</h3></div>
+      <p className="card-desc">{tr('每秒事件数超过阈值时触发中危告警，10 秒冷却期内同类告警不重复触发。', 'Triggers a medium alert when events/sec exceed the threshold. Suppressed for 10s after each alert per kind.')}</p>
       <div className="threshold-grid">
         {['file_io', 'process', 'privilege', 'network', 'hotpatch'].map(k => (
           <div key={k} className="threshold-item">

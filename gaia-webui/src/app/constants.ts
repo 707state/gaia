@@ -18,55 +18,55 @@ export const mockSnapshot: Snapshot = {
   },
   events: [
     {
-      timestamp_ns: Date.now() * 1e6 - 1e9 * 0,
+      timestamp_ns: Date.now() - 0,
       kind: 'network', action: 'blocked', pid: 1148, tgid: 1148, uid: 33, gid: 33,
       comm: 'nginx', detail: 'connect attempt matched blocked_ports policy',
       network: { port: 4444, address: '192.168.1.19' },
     },
     {
-      timestamp_ns: Date.now() * 1e6 - 1e9 * 2,
+      timestamp_ns: Date.now() - 2000,
       kind: 'file_io', action: 'alert', pid: 721, tgid: 721, uid: 0, gid: 0,
       comm: 'sshd', detail: '/etc/shadow',
     },
     {
-      timestamp_ns: Date.now() * 1e6 - 1e9 * 5,
+      timestamp_ns: Date.now() - 5000,
       kind: 'process', action: 'enter', pid: 5521, tgid: 5521, uid: 0, gid: 0,
       comm: 'bash', detail: '/usr/bin/curl',
     },
     {
-      timestamp_ns: Date.now() * 1e6 - 1e9 * 8,
+      timestamp_ns: Date.now() - 8000,
       kind: 'privilege', action: 'alert', pid: 5521, tgid: 5521, uid: 1000, gid: 1000,
       comm: 'sudo', detail: 'setuid:0',
     },
     {
-      timestamp_ns: Date.now() * 1e6 - 1e9 * 12,
+      timestamp_ns: Date.now() - 12000,
       kind: 'network', action: 'enter', pid: 1142, tgid: 1142, uid: 33, gid: 33,
       comm: 'nginx', detail: 'outbound connection',
       network: { port: 443, address: '93.184.216.34' },
     },
     {
-      timestamp_ns: Date.now() * 1e6 - 1e9 * 15,
+      timestamp_ns: Date.now() - 15000,
       kind: 'file_io', action: 'enter', pid: 2001, tgid: 2001, uid: 999, gid: 999,
       comm: 'redis-server', detail: '/var/lib/redis/dump.rdb',
     },
     {
-      timestamp_ns: Date.now() * 1e6 - 1e9 * 20,
+      timestamp_ns: Date.now() - 20000,
       kind: 'hotpatch', action: 'enter', pid: 1142, tgid: 1142, uid: 33, gid: 33,
       comm: 'nginx', detail: 'uprobe-entry',
     },
     {
-      timestamp_ns: Date.now() * 1e6 - 1e9 * 25,
+      timestamp_ns: Date.now() - 25000,
       kind: 'network', action: 'rate_limited', pid: 9921, tgid: 9921, uid: 0, gid: 0,
       comm: 'scanner', detail: 'rate-limit:exceeded',
       network: { port: 80, address: '10.0.0.55' },
     },
     {
-      timestamp_ns: Date.now() * 1e6 - 1e9 * 30,
+      timestamp_ns: Date.now() - 30000,
       kind: 'file_io', action: 'alert', pid: 3010, tgid: 3010, uid: 26, gid: 26,
       comm: 'postgres', detail: '/etc/ssl/private/server.key',
     },
     {
-      timestamp_ns: Date.now() * 1e6 - 1e9 * 35,
+      timestamp_ns: Date.now() - 35000,
       kind: 'process', action: 'enter', pid: 7788, tgid: 7788, uid: 0, gid: 0,
       comm: 'cron', detail: '/usr/sbin/logrotate',
     },
@@ -84,7 +84,7 @@ export const mockSnapshot: Snapshot = {
       level: 'critical',
       reason: 'Blocked outbound connection on port 4444 — active defense policy triggered',
       event: {
-        timestamp_ns: Date.now() * 1e6, kind: 'network', action: 'blocked',
+        timestamp_ns: Date.now(), kind: 'network', action: 'blocked',
         pid: 1148, tgid: 1148, uid: 33, gid: 33, comm: 'nginx',
         detail: 'connect attempt matched blocked_ports policy',
         network: { port: 4444, address: '192.168.1.19' },
@@ -94,7 +94,7 @@ export const mockSnapshot: Snapshot = {
       level: 'high',
       reason: 'Sensitive file /etc/shadow accessed by sshd (pid 721)',
       event: {
-        timestamp_ns: Date.now() * 1e6 - 2e9, kind: 'file_io', action: 'alert',
+        timestamp_ns: Date.now() - 2000, kind: 'file_io', action: 'alert',
         pid: 721, tgid: 721, uid: 0, gid: 0, comm: 'sshd', detail: '/etc/shadow',
       },
     },
@@ -102,7 +102,7 @@ export const mockSnapshot: Snapshot = {
       level: 'high',
       reason: 'Privilege escalation: setuid:0 by sudo (pid 5521)',
       event: {
-        timestamp_ns: Date.now() * 1e6 - 8e9, kind: 'privilege', action: 'alert',
+        timestamp_ns: Date.now() - 8000, kind: 'privilege', action: 'alert',
         pid: 5521, tgid: 5521, uid: 1000, gid: 1000, comm: 'sudo', detail: 'setuid:0',
       },
     },
@@ -110,16 +110,16 @@ export const mockSnapshot: Snapshot = {
       level: 'high',
       reason: 'IP rate limit exceeded from 10.0.0.55',
       event: {
-        timestamp_ns: Date.now() * 1e6 - 25e9, kind: 'network', action: 'rate_limited',
+        timestamp_ns: Date.now() - 25000, kind: 'network', action: 'rate_limited',
         pid: 9921, tgid: 9921, uid: 0, gid: 0, comm: 'scanner', detail: 'rate-limit:exceeded',
         network: { port: 80, address: '10.0.0.55' },
       },
     },
     {
       level: 'medium',
-      reason: 'Syscall baseline exceeded for file_io: 215 > 200 in 30s window',
+      reason: 'Syscall rate exceeded for file_io: 65/s > 50/s',
       event: {
-        timestamp_ns: Date.now() * 1e6 - 40e9, kind: 'file_io', action: 'enter',
+        timestamp_ns: Date.now() - 40000, kind: 'file_io', action: 'enter',
         pid: 1142, tgid: 1142, uid: 33, gid: 33, comm: 'nginx', detail: '/var/log/nginx/access.log',
       },
     },

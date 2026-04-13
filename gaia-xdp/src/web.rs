@@ -52,6 +52,8 @@ pub(crate) async fn run_http_server(shared: Shared, addr: String) -> Result<()> 
         .route("/api/v1/process/{pid}", get(crate::process::api_process_detail))
         .route("/api/v1/upload-lib", post(api_upload_lib))
         .route("/api/v1/reload-hotpatch", post(api_reload_hotpatch))
+        .route("/api/v1/file-event/detail", get(api_file_event_detail))
+        .route("/api/v1/history/events", get(api_history_events))
         .route("/api/v1/ai/config", get(crate::ai::api_ai_get_config).post(crate::ai::api_ai_update_config))
         .route("/api/v1/ai/chat", post(crate::ai::api_ai_chat))
         .route("/api/v1/ai/events", get(crate::ai::api_ai_events))
@@ -433,6 +435,229 @@ async fn api_reload_hotpatch(State(shared): State<Shared>) -> Json<ReloadResult>
                 targets_count: targets.len(),
             })
         }
+    }
+}
+
+// ── File Event Detail API ──
+
+#[derive(Debug, Deserialize)]
+struct FileEventDetailQuery {
+    path: Option<String>,
+    pid: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct FileMetadata {
+    path: String,
+    file_type: String,
+    size_bytes: u64,
+    permissions: String,
+    owner_uid: u32,
+    owner_gid: u32,
+    inode: u64,
+    hard_links: u64,
+    modified_secs: u64,
+    accessed_secs: u64,
+    created_secs: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct FileEventDetail {
+    /// Human-readable explanation of what this event is doing.
+    summary: String,
+    /// Interpretation of the action field.
+    action_meaning: String,
+    /// Whether the file is in the sensitive prefixes policy list.
+    is_sensitive: bool,
+    /// File metadata from stat(2), if the file exists and is accessible.
+    file_meta: Option<FileMetadata>,
+    /// Whether this PID currently has the file open (checked via /proc/pid/fd).
+    currently_open_by_pid: bool,
+}
+
+async fn api_file_event_detail(
+    State(shared): State<Shared>,
+    axum::extract::Query(q): axum::extract::Query<FileEventDetailQuery>,
+) -> Response {
+    let path_str = match q.path {
+        Some(ref p) if !p.is_empty() => p.clone(),
+        _ => return (StatusCode::BAD_REQUEST, "missing 'path' query parameter").into_response(),
+    };
+
+    let policy = shared.policy.read().await;
+    let is_sensitive = policy.sensitive_prefixes.iter()
+        .filter(|p| p.enabled)
+        .any(|p| path_str.starts_with(&p.value));
+    drop(policy);
+
+    // Stat the file
+    let file_meta = read_file_metadata(&path_str);
+
+    // Check if the PID currently has this file open
+    let currently_open_by_pid = if let Some(pid) = q.pid {
+        check_file_open_by_pid(pid, &path_str)
+    } else {
+        false
+    };
+
+    // Build human-readable summary and action meaning based on available info
+    let (summary, action_meaning) = build_file_event_explanation(
+        &path_str,
+        q.pid,
+        is_sensitive,
+        &file_meta,
+        currently_open_by_pid,
+    );
+
+    let detail = FileEventDetail {
+        summary,
+        action_meaning,
+        is_sensitive,
+        file_meta,
+        currently_open_by_pid,
+    };
+
+    Json(detail).into_response()
+}
+
+fn read_file_metadata(path: &str) -> Option<FileMetadata> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = fs::metadata(path).ok()?;
+
+    let file_type = if meta.is_dir() {
+        "directory"
+    } else if meta.is_symlink() {
+        "symlink"
+    } else if meta.is_file() {
+        "regular file"
+    } else {
+        "special"
+    }
+    .to_string();
+
+    let mode = meta.mode();
+    let permissions = format_unix_permissions(mode);
+
+    Some(FileMetadata {
+        path: path.to_string(),
+        file_type,
+        size_bytes: meta.len(),
+        permissions,
+        owner_uid: meta.uid(),
+        owner_gid: meta.gid(),
+        inode: meta.ino(),
+        hard_links: meta.nlink(),
+        modified_secs: meta.mtime() as u64,
+        accessed_secs: meta.atime() as u64,
+        created_secs: meta.ctime() as u64,
+    })
+}
+
+fn format_unix_permissions(mode: u32) -> String {
+    let chars: Vec<char> = [
+        (0o400, 'r'), (0o200, 'w'), (0o100, 'x'),
+        (0o040, 'r'), (0o020, 'w'), (0o010, 'x'),
+        (0o004, 'r'), (0o002, 'w'), (0o001, 'x'),
+    ]
+    .iter()
+    .map(|(bit, ch)| if mode & bit != 0 { *ch } else { '-' })
+    .collect();
+    format!("{}{}{}{}{}{}{}{}{}{}",
+        if mode & 0o170000 == 0o040000 { 'd' } else if mode & 0o170000 == 0o120000 { 'l' } else { '-' },
+        chars[0], chars[1], chars[2],
+        chars[3], chars[4], chars[5],
+        chars[6], chars[7], chars[8],
+    )
+}
+
+fn check_file_open_by_pid(pid: u32, target_path: &str) -> bool {
+    let fd_dir = format!("/proc/{pid}/fd");
+    let Ok(entries) = fs::read_dir(&fd_dir) else { return false };
+    for entry in entries.flatten() {
+        if let Ok(link_target) = fs::read_link(entry.path()) {
+            if link_target.to_string_lossy() == target_path {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn build_file_event_explanation(
+    path: &str,
+    pid: Option<u32>,
+    is_sensitive: bool,
+    file_meta: &Option<FileMetadata>,
+    currently_open: bool,
+) -> (String, String) {
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+
+    let sensitivity_note = if is_sensitive {
+        " This file is on the sensitive paths watch list."
+    } else {
+        ""
+    };
+
+    let open_note = if currently_open {
+        " The process currently has this file open."
+    } else {
+        ""
+    };
+
+    let type_note = match file_meta.as_ref().map(|m| m.file_type.as_str()) {
+        Some("directory") => " Target is a directory.",
+        Some("symlink") => " Target is a symbolic link.",
+        Some("special") => " Target is a special device file.",
+        _ => "",
+    };
+
+    let pid_str = pid.map(|p| format!(" by PID {p}")).unwrap_or_default();
+
+    let summary = format!(
+        "openat() syscall on \"{file_name}\"{pid_str}.{sensitivity_note}{type_note}{open_note}"
+    );
+
+    let action_meaning = format!(
+        "The process is requesting to open \"{path}\" via the openat() system call. \
+        The kernel intercepted this at the sys_enter_openat tracepoint and recorded the \
+        file path.{}",
+        if is_sensitive {
+            " Because the path matches a sensitive prefix in the monitoring policy, \
+            this event was escalated to an alert."
+        } else {
+            " The path does not match any sensitive prefix in the current policy."
+        }
+    );
+
+    (summary, action_meaning)
+}
+
+// ── History API ──
+
+#[derive(Debug, Deserialize)]
+struct HistoryQuery {
+    kind: Option<String>,
+    page: Option<u32>,
+    page_size: Option<u32>,
+    since_ms: Option<i64>,
+    until_ms: Option<i64>,
+}
+
+async fn api_history_events(
+    State(shared): State<Shared>,
+    axum::extract::Query(q): axum::extract::Query<HistoryQuery>,
+) -> Response {
+    let filter = crate::db::EventFilter {
+        kind: q.kind,
+        since_ms: q.since_ms,
+        until_ms: q.until_ms,
+        page: q.page.unwrap_or(0),
+        page_size: q.page_size.unwrap_or(50),
+    };
+    match shared.db.query_events(filter).await {
+        Ok(page) => Json(page).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e:#}")).into_response(),
     }
 }
 

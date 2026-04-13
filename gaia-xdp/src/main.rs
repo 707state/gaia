@@ -5,7 +5,7 @@ use std::{
     net::Ipv4Addr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use std::convert::Infallible;
 
@@ -46,6 +46,7 @@ use tokio_stream::StreamExt as TokioStreamExt;
 use tower_http::cors::CorsLayer;
 
 mod ai;
+mod db;
 mod process;
 mod web;
 
@@ -57,7 +58,8 @@ struct WebAssets;
 const DEFAULT_CONFIG: &str = "gaia.toml";
 const MAX_EVENT_HISTORY: usize = 512;
 const MAX_ALERT_HISTORY: usize = 256;
-const BASELINE_WINDOW_SECS: u64 = 30;
+/// How long (seconds) to suppress repeated baseline alerts for the same event kind.
+const BASELINE_ALERT_COOLDOWN_SECS: u64 = 10;
 /// Capacity of the broadcast channel for AI alert notifications.
 const AI_ALERT_CHANNEL_CAP: usize = 64;
 /// Maximum number of recent events to include as context in AI chat.
@@ -137,6 +139,8 @@ struct Opt {
     config: PathBuf,
     #[arg(long, default_value = "0.0.0.0:17890")]
     web_listen: String,
+    #[arg(long, default_value = "gaia-events.db")]
+    db_path: String,
 }
 
 // ── Policy config (YAML / TOML) ──
@@ -268,11 +272,11 @@ impl Default for MonitorPolicy {
                 TogglePort { port: 31337, enabled: true },
             ],
             baseline_thresholds: HashMap::from([
-                ("file_io".to_string(), 200),
-                ("process".to_string(), 80),
-                ("privilege".to_string(), 20),
-                ("network".to_string(), 160),
-                ("hotpatch".to_string(), 50),
+                ("file_io".to_string(), 50),
+                ("process".to_string(), 20),
+                ("privilege".to_string(), 5),
+                ("network".to_string(), 40),
+                ("hotpatch".to_string(), 10),
             ]),
             hotpatch: HotpatchPolicy::default(),
             rate_limit_rules: Vec::new(),
@@ -372,8 +376,10 @@ struct FeatureStatus {
 
 #[derive(Debug)]
 struct BaselineState {
-    window_started: Instant,
-    counters: HashMap<String, u32>,
+    /// Per-kind: (window_start, count_in_current_1s_window)
+    windows: HashMap<String, (Instant, u32)>,
+    /// Per-kind: when the last baseline alert was fired (for cooldown).
+    last_alert: HashMap<String, Instant>,
 }
 
 #[derive(Debug)]
@@ -401,11 +407,48 @@ impl RuntimeState {
             events: VecDeque::new(),
             alerts: VecDeque::new(),
             baseline: BaselineState {
-                window_started: Instant::now(),
-                counters: HashMap::new(),
+                windows: HashMap::new(),
+                last_alert: HashMap::new(),
             },
             traffic: TrafficSnapshot::default(),
         }
+    }
+}
+
+/// Anchor for converting bpf_ktime_get_ns() (CLOCK_BOOTTIME, nanoseconds since boot)
+/// to Unix epoch milliseconds. Sampled once at startup by reading both clocks as close
+/// together as possible.
+#[derive(Clone, Copy)]
+struct KtimeAnchor {
+    /// Unix epoch milliseconds at the moment the anchor was taken.
+    unix_epoch_ms: u64,
+    /// bpf_ktime_get_ns() value read from /proc/timer_list (or estimated via
+    /// /proc/uptime) at the same moment.
+    ktime_ns: u64,
+}
+
+impl KtimeAnchor {
+    /// Sample the anchor by reading /proc/uptime (seconds since boot) and
+    /// SystemTime::now() together. This avoids needing root or a BPF call.
+    fn sample() -> Self {
+        let uptime_content = fs::read_to_string("/proc/uptime").unwrap_or_default();
+        let uptime_secs: f64 = uptime_content
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        let unix_epoch_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let ktime_ns = (uptime_secs * 1_000_000_000.0) as u64;
+        Self { unix_epoch_ms, ktime_ns }
+    }
+
+    /// Convert a bpf_ktime_get_ns() timestamp to Unix epoch milliseconds.
+    fn to_epoch_ms(self, ktime_ns: u64) -> u64 {
+        let delta_ms = (ktime_ns as i64 - self.ktime_ns as i64) / 1_000_000;
+        (self.unix_epoch_ms as i64 + delta_ms).max(0) as u64
     }
 }
 
@@ -423,6 +466,10 @@ struct Shared {
     ai_config: Arc<RwLock<AiConfig>>,
     /// Broadcast channel for pushing high-severity alert notifications to AI event stream.
     ai_alert_tx: broadcast::Sender<AiAlertNotification>,
+    /// Anchor for ktime → Unix epoch conversion.
+    ktime_anchor: KtimeAnchor,
+    /// SQLite event history database.
+    db: Arc<db::EventDb>,
 }
 
 // ── main ──
@@ -450,6 +497,20 @@ async fn main() -> Result<()> {
     let ai_config = ai::load_ai_config(&opt.config);
     info!("AI analysis system: enabled={}", ai_config.enabled);
 
+    // Sample ktime anchor before the event loop starts so timestamps can be
+    // converted from CLOCK_BOOTTIME to Unix epoch milliseconds.
+    let ktime_anchor = KtimeAnchor::sample();
+    info!(
+        "ktime anchor: unix_epoch_ms={}, ktime_ns={}",
+        ktime_anchor.unix_epoch_ms, ktime_anchor.ktime_ns
+    );
+
+    // Open SQLite event history database.
+    let event_db = db::EventDb::open(&opt.db_path)
+        .await
+        .with_context(|| format!("open event db at {}", opt.db_path))?;
+    info!("event history db opened: {}", opt.db_path);
+
     let shared = Shared {
         policy: Arc::new(RwLock::new(policy.clone())),
         config_path: opt.config.clone(),
@@ -460,6 +521,8 @@ async fn main() -> Result<()> {
         code_patches: Arc::new(Mutex::new(Vec::new())),
         ai_config: Arc::new(RwLock::new(ai_config)),
         ai_alert_tx,
+        ktime_anchor,
+        db: Arc::new(event_db),
     };
 
     // The kprobe guard was already attached in attach_agents(), so the
@@ -2492,7 +2555,7 @@ fn spawn_traffic_sampler(shared: Shared) {
 // ── Anomaly detection engine ──
 
 async fn process_event(event: KernelEvent, shared: &Shared) {
-    let mut record = to_event_record(event);
+    let mut record = to_event_record(event, shared.ktime_anchor);
     let mut state = shared.runtime.write().await;
     let policy = shared.policy.read().await;
     // Collect AI notifications to send after releasing the write lock.
@@ -2507,28 +2570,55 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
         .cloned();
     record.service = service.clone();
 
+    // Persist to SQLite history (fire-and-forget; never blocks the event loop).
+    {
+        let db = shared.db.clone();
+        let r = record.clone();
+        tokio::spawn(async move {
+            if let Err(e) = db.insert_event(r).await {
+                log::warn!("db insert_event failed: {e:#}");
+            }
+        });
+    }
+
     let key = record.kind.clone();
     *state.counters.entry(key.clone()).or_insert(0) += 1;
 
-    // Statistical baseline: reset window periodically
-    if state.baseline.window_started.elapsed() > Duration::from_secs(BASELINE_WINDOW_SECS) {
-        state.baseline.window_started = Instant::now();
-        state.baseline.counters.clear();
-    }
-    let baseline_count = state.baseline.counters.entry(key.clone()).or_insert(0);
-    *baseline_count += 1;
-    let baseline_now = *baseline_count;
+    // ── Per-second rate baseline detection ──
+    // Each kind has a 1-second sliding window. If the rate in the current second
+    // exceeds the configured threshold (events/sec), fire one alert and then
+    // suppress further alerts for that kind for BASELINE_ALERT_COOLDOWN_SECS.
+    if let Some(&threshold) = policy.baseline_thresholds.get(&key) {
+        let now = Instant::now();
+        let (window_start, count) = state.baseline.windows
+            .entry(key.clone())
+            .or_insert((now, 0));
 
-    // Baseline spike detection
-    if let Some(threshold) = policy.baseline_thresholds.get(&key)
-        && baseline_now > *threshold
-    {
-        if let Some(n) = push_alert(
-            &mut state,
-            "medium",
-            format!("syscall baseline exceeded for {key}: {baseline_now} > {threshold}"),
-            &record,
-        ) { ai_notifications.push(n); }
+        if window_start.elapsed() >= Duration::from_secs(1) {
+            // New second: reset window
+            *window_start = now;
+            *count = 1;
+        } else {
+            *count += 1;
+        }
+        let rate = *count;
+
+        if rate > threshold {
+            // Only alert if outside the cooldown period for this kind
+            let in_cooldown = state.baseline.last_alert.get(&key)
+                .map(|t| t.elapsed() < Duration::from_secs(BASELINE_ALERT_COOLDOWN_SECS))
+                .unwrap_or(false);
+
+            if !in_cooldown {
+                state.baseline.last_alert.insert(key.clone(), now);
+                if let Some(n) = push_alert(
+                    &mut state,
+                    "medium",
+                    format!("syscall rate exceeded for {key}: {rate}/s > {threshold}/s"),
+                    &record,
+                ) { ai_notifications.push(n); }
+            }
+        }
     }
 
     // Whitelist rule: sensitive file access
@@ -2726,7 +2816,7 @@ fn push_alert(
 
 // ── Event conversion ──
 
-fn to_event_record(event: KernelEvent) -> EventRecord {
+fn to_event_record(event: KernelEvent, anchor: KtimeAnchor) -> EventRecord {
     let comm = fixed_to_string(&event.comm);
     let detail = fixed_to_string(&event.detail);
     let network = if event.kind == EVENT_KIND_NETWORK {
@@ -2738,8 +2828,12 @@ fn to_event_record(event: KernelEvent) -> EventRecord {
         None
     };
 
+    // Convert bpf_ktime_get_ns() (CLOCK_BOOTTIME nanoseconds) to Unix epoch
+    // milliseconds so the frontend can display wall-clock times correctly.
+    let timestamp_ms = anchor.to_epoch_ms(event.timestamp_ns);
+
     EventRecord {
-        timestamp_ns: event.timestamp_ns,
+        timestamp_ns: timestamp_ms,
         kind: kind_name(event.kind).to_string(),
         action: action_name(event.action).to_string(),
         pid: event.pid,

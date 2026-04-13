@@ -9,3 +9,6 @@ target/
 **/*.rs.bk
 **/Cargo.lock
 /.codex
+/gaia-events.db
+/gaia-events.db-shm
+/gaia-events.db-wal

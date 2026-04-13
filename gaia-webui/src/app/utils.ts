@@ -30,15 +30,16 @@ export function mapAction(action: string, lang: Lang) {
   return (m[action] ?? { zh: action, en: action })[lang]
 }
 
-export function formatTimestamp(ns: number) {
-  const ms = ns / 1e6
-  const d = new Date(ms)
+// timestamp_ns is actually Unix epoch milliseconds (converted on the Rust side
+// from bpf_ktime_get_ns CLOCK_BOOTTIME to wall-clock time).
+export function formatTimestamp(epochMs: number) {
+  const d = new Date(epochMs)
   if (isNaN(d.getTime())) return '-'
   return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
-export function relativeTime(ns: number, lang: Lang) {
-  const diff = Date.now() - ns / 1e6
+export function relativeTime(epochMs: number, lang: Lang) {
+  const diff = Date.now() - epochMs
   if (diff < 0 || isNaN(diff)) return '-'
   const secs = Math.floor(diff / 1000)
   if (secs < 60) return lang === 'zh' ? `${secs}秒前` : `${secs}s ago`
