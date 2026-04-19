@@ -47,6 +47,7 @@ use tower_http::cors::CorsLayer;
 
 mod ai;
 mod db;
+mod livepatch;
 mod process;
 mod web;
 
@@ -187,6 +188,9 @@ fn default_true() -> bool {
 struct HotpatchPolicy {
     #[serde(default)]
     targets: Vec<HotpatchTarget>,
+    /// Kernel livepatch targets (replace kernel functions via klp_patch API).
+    #[serde(default)]
+    kernel_livepatch: Vec<livepatch::KernelLivepatchTarget>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -226,6 +230,9 @@ enum PatchAction {
     /// Replace the function implementation with one from a shared library.
     /// Requires `replace_lib` to be set on the target.
     ReplaceFunction,
+    /// Patch a kernel function using the Linux livepatch API (klp_patch).
+    /// Requires root, CONFIG_LIVEPATCH=y, and kernel-devel headers.
+    KernelLivepatch,
 }
 
 fn default_patch_action() -> PatchAction {
@@ -470,6 +477,8 @@ struct Shared {
     ktime_anchor: KtimeAnchor,
     /// SQLite event history database.
     db: Arc<db::EventDb>,
+    /// Kernel livepatch module manager.
+    livepatch_mgr: Arc<tokio::sync::Mutex<livepatch::LivepatchManager>>,
 }
 
 // ── main ──
@@ -511,6 +520,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("open event db at {}", opt.db_path))?;
     info!("event history db opened: {}", opt.db_path);
 
+    let livepatch_build_dir = std::env::temp_dir().join("gaia-livepatch");
     let shared = Shared {
         policy: Arc::new(RwLock::new(policy.clone())),
         config_path: opt.config.clone(),
@@ -523,6 +533,9 @@ async fn main() -> Result<()> {
         ai_alert_tx,
         ktime_anchor,
         db: Arc::new(event_db),
+        livepatch_mgr: Arc::new(tokio::sync::Mutex::new(
+            livepatch::LivepatchManager::new(livepatch_build_dir),
+        )),
     };
 
     // The kprobe guard was already attached in attach_agents(), so the
@@ -576,10 +589,51 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Clean up any gaia_klp_* modules left in the kernel from a previous run.
+    {
+        let mut mgr = shared.livepatch_mgr.lock().await;
+        mgr.cleanup_stale_modules().await;
+    }
+
+    // Apply kernel livepatches from config (best-effort; failures are logged but don't abort).
+    apply_kernel_livepatches(&shared, &policy.hotpatch.kernel_livepatch).await;
+
     info!("gaia controller started — press Ctrl-C to stop");
     signal::ctrl_c().await.context("waiting for ctrl-c")?;
     info!("gaia controller exiting");
+
+    // Clean up kernel livepatches on exit.
+    {
+        let mut mgr = shared.livepatch_mgr.lock().await;
+        mgr.remove_all().await;
+    }
+
     Ok(())
+}
+
+/// Apply all enabled kernel livepatch targets from the policy.
+async fn apply_kernel_livepatches(
+    shared: &Shared,
+    targets: &[livepatch::KernelLivepatchTarget],
+) {
+    let enabled: Vec<_> = targets.iter().filter(|t| t.enabled).cloned().collect();
+    if enabled.is_empty() {
+        return;
+    }
+
+    match livepatch::check_livepatch_support().await {
+        Ok(()) => info!("kernel livepatch: support confirmed"),
+        Err(e) => {
+            warn!("kernel livepatch: support check failed — skipping: {e:#}");
+            return;
+        }
+    }
+
+    let mut mgr = shared.livepatch_mgr.lock().await;
+    match mgr.apply(&enabled).await {
+        Ok(name) => info!("kernel livepatch: module {name} applied ({} func(s))", enabled.len()),
+        Err(e) => warn!("kernel livepatch: failed to apply: {e:#}"),
+    }
 }
 
 // ── eBPF attach ──
@@ -918,6 +972,8 @@ fn sync_bpf_hotpatch_rules(shared: &Shared, targets: &[HotpatchTarget]) {
                     PatchAction::OverrideReturn => HOTPATCH_ACTION_OVERRIDE_RETURN,
                     PatchAction::SkipCall => HOTPATCH_ACTION_SKIP_CALL,
                     PatchAction::ReplaceFunction => HOTPATCH_ACTION_REPLACE_FUNCTION,
+                    // Kernel livepatches are managed separately; skip in eBPF rules.
+                    PatchAction::KernelLivepatch => continue,
                 };
                 let entry = HotpatchRuleEntry {
                     action,

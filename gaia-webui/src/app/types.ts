@@ -129,13 +129,29 @@ export type HotpatchTarget = {
   replace_symbol?: string | null
 }
 
+export type KernelLivepatchTarget = {
+  old_func: string
+  new_func_body: string
+  func_ret: string
+  func_args: string
+  obj_name?: string | null
+  enabled: boolean
+}
+
+export type LivepatchStatus = {
+  name: string
+  state: string
+  enabled: boolean | null
+  build_dir: string
+}
+
 export type MonitorPolicy = {
   sensitive_prefixes: ToggleItem[]
   monitored_services: ToggleItem[]
   exec_whitelist_prefixes: ToggleItem[]
   blocked_ports: TogglePort[]
   baseline_thresholds: Record<string, number>
-  hotpatch: { targets: HotpatchTarget[] }
+  hotpatch: { targets: HotpatchTarget[]; kernel_livepatch: KernelLivepatchTarget[] }
   rate_limit_rules: RateLimitRule[]
 }
 

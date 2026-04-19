@@ -9,6 +9,7 @@ import {
   BaselinePanel,
   BlockedPortsPanel,
   HotpatchConfigPanel,
+  KernelLivepatchPanel,
   RateLimitPanel,
 } from './app/components/ConfigPanels'
 import {
@@ -1501,7 +1502,8 @@ function ConfigTab({ lang, tr }: { lang: Lang; tr: (zh: string, en: string) => s
       <BlockedPortsPanel policy={policy} setPolicy={setPolicy} toggle={toggle} flash={flash} tr={tr} />
       <BaselinePanel policy={policy} setPolicy={setPolicy} saving={saving} setSaving={setSaving} flash={flash} lang={lang} tr={tr} />
       <RateLimitPanel rules={policy.rate_limit_rules} setRules={r => setPolicy({ ...policy, rate_limit_rules: r })} toggle={toggle} flash={flash} tr={tr} />
-      <HotpatchConfigPanel targets={policy.hotpatch.targets} setTargets={t => setPolicy({ ...policy, hotpatch: { targets: t } })} toggle={toggle} flash={flash} tr={tr} />
+      <HotpatchConfigPanel targets={policy.hotpatch.targets} setTargets={t => setPolicy({ ...policy, hotpatch: { ...policy.hotpatch, targets: t } })} toggle={toggle} flash={flash} tr={tr} />
+      <KernelLivepatchPanel targets={policy.hotpatch.kernel_livepatch ?? []} setTargets={t => setPolicy({ ...policy, hotpatch: { ...policy.hotpatch, kernel_livepatch: t } })} flash={flash} tr={tr} />
       <AiConfigPanel tr={tr} flash={flash} />
     </div>
   )

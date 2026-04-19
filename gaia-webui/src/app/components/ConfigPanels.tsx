@@ -3,7 +3,9 @@ import type {
   AiConfig,
   AiProvider,
   HotpatchTarget,
+  KernelLivepatchTarget,
   Lang,
+  LivepatchStatus,
   MonitorPolicy,
   PatchAction,
   RateLimitRule,
@@ -559,6 +561,218 @@ export function HotpatchConfigPanel({ targets, setTargets, toggle, flash, tr }: 
             />
           </div>
         )}
+      </div>
+    </div>
+  )
+}
+
+const emptyKlpTarget: KernelLivepatchTarget = {
+  old_func: '',
+  new_func_body: '    return 0;',
+  func_ret: 'static int',
+  func_args: 'void',
+  obj_name: null,
+  enabled: true,
+}
+
+export function KernelLivepatchPanel({ targets, setTargets, flash, tr }: {
+  targets: KernelLivepatchTarget[]
+  setTargets: (t: KernelLivepatchTarget[]) => void
+  flash: (msg: string) => void
+  tr: TranslateFn
+}) {
+  const [draft, setDraft] = useState<KernelLivepatchTarget>({ ...emptyKlpTarget })
+  const [status, setStatus] = useState<LivepatchStatus[]>([])
+  const [reloading, setReloading] = useState(false)
+
+  const fetchStatus = async () => {
+    try {
+      const r = await fetch('/api/v1/kernel-livepatch/status')
+      if (r.ok) setStatus(await r.json())
+    } catch { /* offline */ }
+  }
+
+  useEffect(() => { fetchStatus() }, [])
+
+  const handleToggle = async (index: number, enabled: boolean) => {
+    const updated = { ...targets[index], enabled }
+    try {
+      const r = await fetch(`/api/v1/config/kernel-livepatch/${index}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updated),
+      })
+      if (r.ok) {
+        setTargets(await r.json())
+        flash(enabled ? tr('已启用', 'Enabled') : tr('已禁用', 'Disabled'))
+      } else {
+        flash(tr('切换失败', 'Toggle failed'))
+      }
+    } catch {
+      flash(tr('切换失败: 网络错误', 'Toggle failed: network error'))
+    }
+  }
+
+  const handleAdd = async () => {
+    if (!draft.old_func.trim()) {
+      flash(tr('内核函数名必填', 'Kernel function name is required'))
+      return
+    }
+    if (!draft.new_func_body.trim()) {
+      flash(tr('替换函数体必填', 'Replacement function body is required'))
+      return
+    }
+    try {
+      const r = await fetch('/api/v1/config/kernel-livepatch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...draft, old_func: draft.old_func.trim() }),
+      })
+      if (r.ok) {
+        setTargets(await r.json())
+        setDraft({ ...emptyKlpTarget })
+        flash(tr('内核补丁目标已添加', 'Kernel livepatch target added'))
+      } else {
+        flash(tr('添加失败: ', 'Add failed: ') + await r.text())
+      }
+    } catch {
+      flash(tr('添加失败: 网络错误', 'Add failed: network error'))
+    }
+  }
+
+  const handleDelete = async (index: number) => {
+    try {
+      const r = await fetch(`/api/v1/config/kernel-livepatch/${index}`, { method: 'DELETE' })
+      if (r.ok) { setTargets(await r.json()); flash(tr('目标已删除', 'Target removed')) }
+    } catch {
+      flash(tr('删除失败', 'Delete failed'))
+    }
+  }
+
+  const handleReload = async () => {
+    setReloading(true)
+    try {
+      const r = await fetch('/api/v1/kernel-livepatch/reload', { method: 'POST' })
+      const data = await r.json() as { success: boolean; message: string; module_name: string | null }
+      flash(data.success
+        ? tr(`内核补丁已应用: ${data.module_name ?? ''}`, `Kernel livepatch applied: ${data.module_name ?? ''}`)
+        : tr('应用失败: ', 'Apply failed: ') + data.message)
+      await fetchStatus()
+    } catch {
+      flash(tr('应用失败: 网络错误', 'Apply failed: network error'))
+    }
+    setReloading(false)
+  }
+
+  const enabled = targets.filter(t => t.enabled).length
+
+  return (
+    <div className="card">
+      <div className="card-header">
+        <h3>{tr('内核热补丁 (Kernel Livepatch)', 'Kernel Livepatch')}</h3>
+        <div className="header-actions">
+          <button className="btn-reload" onClick={handleReload} disabled={reloading || enabled === 0}>
+            {reloading ? tr('应用中...', 'Applying...') : tr('应用补丁', 'Apply Patches')}
+          </button>
+          <span className="card-badge">{enabled}/{targets.length} {tr('启用', 'enabled')}</span>
+        </div>
+      </div>
+      <p className="card-desc">{tr(
+        '通过 Linux klp_patch API 在内核态替换函数，无需重启内核。需要 root 权限、CONFIG_LIVEPATCH=y 和 kernel-devel 头文件。补丁以 C 内核模块形式编译并通过 insmod 加载。',
+        'Replace kernel functions via the Linux klp_patch API without rebooting. Requires root, CONFIG_LIVEPATCH=y, and kernel-devel headers. Patches are compiled as C kernel modules and loaded via insmod.'
+      )}</p>
+
+      {status.length > 0 && (
+        <div className="toggle-list" style={{ marginBottom: 12 }}>
+          <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 6 }}>
+            {tr('已加载模块', 'Loaded Modules')}
+          </div>
+          {status.map(s => (
+            <div key={s.name} className="toggle-row">
+              <code className="toggle-value">{s.name}</code>
+              <span className={`action-tag ${s.enabled ? 'action-replace' : 'action-log'}`}>
+                {s.enabled ? tr('已激活', 'active') : tr('已禁用', 'disabled')}
+              </span>
+              <span className="toggle-meta">{s.state}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {targets.length > 0 && (
+        <div className="toggle-list">
+          {targets.map((t, i) => (
+            <div key={i} className={`toggle-row hotpatch-row ${t.enabled ? '' : 'disabled'}`}>
+              <button
+                className={`switch ${t.enabled ? 'on' : 'off'}`}
+                onClick={() => handleToggle(i, !t.enabled)}
+                title={t.enabled ? tr('点击禁用', 'Click to disable') : tr('点击启用', 'Click to enable')}
+              >
+                <span className="switch-knob" />
+              </button>
+              <div className="toggle-detail hotpatch-detail" style={{ flex: 1 }}>
+                <div className="hotpatch-main">
+                  <code>{t.old_func}</code>
+                  <span className="toggle-meta">{t.func_ret}({t.func_args})</span>
+                  {t.obj_name && <span className="toggle-meta">mod: {t.obj_name}</span>}
+                </div>
+                <pre style={{ margin: '4px 0 0', fontSize: 11, color: 'var(--text-muted)', whiteSpace: 'pre-wrap', wordBreak: 'break-all', background: 'none' }}>
+                  {t.new_func_body.trim().slice(0, 120)}{t.new_func_body.trim().length > 120 ? '…' : ''}
+                </pre>
+              </div>
+              <button className="btn-danger-sm" onClick={() => handleDelete(i)}>{tr('删除', 'Delete')}</button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="add-form">
+        <h4>{tr('新增内核补丁目标', 'Add Kernel Livepatch Target')}</h4>
+        <div className="add-row" style={{ flexWrap: 'wrap', gap: 8 }}>
+          <input
+            type="text"
+            placeholder={tr('内核函数名, 如 cmdline_proc_show', 'Kernel function, e.g. cmdline_proc_show')}
+            value={draft.old_func}
+            onChange={e => setDraft({ ...draft, old_func: e.target.value })}
+            style={{ minWidth: 220 }}
+          />
+          <input
+            type="text"
+            placeholder={tr('返回类型, 如 static int', 'Return type, e.g. static int')}
+            value={draft.func_ret}
+            onChange={e => setDraft({ ...draft, func_ret: e.target.value })}
+            style={{ minWidth: 150 }}
+          />
+          <input
+            type="text"
+            placeholder={tr('参数列表, 如 struct seq_file *m, void *v', 'Args, e.g. struct seq_file *m, void *v')}
+            value={draft.func_args}
+            onChange={e => setDraft({ ...draft, func_args: e.target.value })}
+            style={{ minWidth: 260 }}
+          />
+          <input
+            type="text"
+            placeholder={tr('内核模块名（留空=vmlinux）', 'Kernel module (empty = vmlinux)')}
+            value={draft.obj_name ?? ''}
+            onChange={e => setDraft({ ...draft, obj_name: e.target.value || null })}
+            style={{ minWidth: 160 }}
+          />
+        </div>
+        <div style={{ marginTop: 8 }}>
+          <label style={{ fontSize: 12, color: 'var(--text-muted)', display: 'block', marginBottom: 4 }}>
+            {tr('替换函数体 (C 代码，函数体内容)', 'Replacement function body (C code inside { })')}
+          </label>
+          <textarea
+            rows={5}
+            style={{ width: '100%', fontFamily: 'monospace', fontSize: 12, padding: '8px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg-input, #f8fafc)', resize: 'vertical', boxSizing: 'border-box' }}
+            placeholder={'    seq_puts(m, "GAIA_PROTECTED\\n");\n    return 0;'}
+            value={draft.new_func_body}
+            onChange={e => setDraft({ ...draft, new_func_body: e.target.value })}
+          />
+        </div>
+        <div style={{ marginTop: 8 }}>
+          <button className="btn-primary" onClick={handleAdd}>{tr('添加目标', 'Add Target')}</button>
+        </div>
       </div>
     </div>
   )

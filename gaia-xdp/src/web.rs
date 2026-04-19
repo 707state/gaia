@@ -52,6 +52,10 @@ pub(crate) async fn run_http_server(shared: Shared, addr: String) -> Result<()> 
         .route("/api/v1/process/{pid}", get(crate::process::api_process_detail))
         .route("/api/v1/upload-lib", post(api_upload_lib))
         .route("/api/v1/reload-hotpatch", post(api_reload_hotpatch))
+        .route("/api/v1/config/kernel-livepatch", get(api_get_kernel_livepatch).post(api_add_kernel_livepatch))
+        .route("/api/v1/config/kernel-livepatch/{index}", axum::routing::delete(api_delete_kernel_livepatch).put(api_update_kernel_livepatch))
+        .route("/api/v1/kernel-livepatch/status", get(api_kernel_livepatch_status))
+        .route("/api/v1/kernel-livepatch/reload", post(api_reload_kernel_livepatch))
         .route("/api/v1/file-event/detail", get(api_file_event_detail))
         .route("/api/v1/history/events", get(api_history_events))
         .route("/api/v1/ai/config", get(crate::ai::api_ai_get_config).post(crate::ai::api_ai_update_config))
@@ -391,6 +395,17 @@ async fn api_toggle_item(
             persist_policy(&shared).await;
             return Ok(Json(snapshot));
         }
+        "kernel_livepatch" => {
+            if req.index < policy.hotpatch.kernel_livepatch.len() {
+                policy.hotpatch.kernel_livepatch[req.index].enabled = req.enabled;
+            }
+            let snapshot = policy.clone();
+            drop(policy);
+            persist_policy(&shared).await;
+            // Immediately sync kernel state: unload all then re-apply enabled targets.
+            tokio::spawn(async move { sync_kernel_livepatches(&shared).await });
+            return Ok(Json(snapshot));
+        }
         _ => return Err(StatusCode::BAD_REQUEST),
     }
     let snapshot = policy.clone();
@@ -436,6 +451,133 @@ async fn api_reload_hotpatch(State(shared): State<Shared>) -> Json<ReloadResult>
             })
         }
     }
+}
+
+// ── Kernel Livepatch API ──
+
+async fn api_get_kernel_livepatch(
+    State(shared): State<Shared>,
+) -> Json<Vec<livepatch::KernelLivepatchTarget>> {
+    let policy = shared.policy.read().await;
+    Json(policy.hotpatch.kernel_livepatch.clone())
+}
+
+async fn api_add_kernel_livepatch(
+    State(shared): State<Shared>,
+    Json(target): Json<livepatch::KernelLivepatchTarget>,
+) -> Json<Vec<livepatch::KernelLivepatchTarget>> {
+    let mut policy = shared.policy.write().await;
+    policy.hotpatch.kernel_livepatch.push(target);
+    let targets = policy.hotpatch.kernel_livepatch.clone();
+    drop(policy);
+    persist_policy(&shared).await;
+    Json(targets)
+}
+
+async fn api_delete_kernel_livepatch(
+    State(shared): State<Shared>,
+    AxumPath(index): AxumPath<usize>,
+) -> Json<Vec<livepatch::KernelLivepatchTarget>> {
+    let mut policy = shared.policy.write().await;
+    if index < policy.hotpatch.kernel_livepatch.len() {
+        policy.hotpatch.kernel_livepatch.remove(index);
+    }
+    let targets = policy.hotpatch.kernel_livepatch.clone();
+    drop(policy);
+    persist_policy(&shared).await;
+    Json(targets)
+}
+
+async fn api_update_kernel_livepatch(
+    State(shared): State<Shared>,
+    AxumPath(index): AxumPath<usize>,
+    Json(target): Json<livepatch::KernelLivepatchTarget>,
+) -> Result<Json<Vec<livepatch::KernelLivepatchTarget>>, StatusCode> {
+    let mut policy = shared.policy.write().await;
+    if index >= policy.hotpatch.kernel_livepatch.len() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    policy.hotpatch.kernel_livepatch[index] = target;
+    let targets = policy.hotpatch.kernel_livepatch.clone();
+    drop(policy);
+    persist_policy(&shared).await;
+    // Immediately sync kernel state: unload all then re-apply enabled targets.
+    tokio::spawn(async move { sync_kernel_livepatches(&shared).await });
+    Ok(Json(targets))
+}
+
+async fn api_kernel_livepatch_status(
+    State(shared): State<Shared>,
+) -> Json<Vec<livepatch::LivepatchStatus>> {
+    let mgr = shared.livepatch_mgr.lock().await;
+    Json(mgr.status())
+}
+
+#[derive(Serialize)]
+struct KernelLivepatchReloadResult {
+    success: bool,
+    message: String,
+    module_name: Option<String>,
+}
+
+/// Core kernel livepatch sync: remove all loaded modules then apply enabled targets.
+/// Called by toggle, PUT update, and explicit reload.
+async fn sync_kernel_livepatches(shared: &Shared) -> KernelLivepatchReloadResult {
+    let targets: Vec<_> = {
+        let policy = shared.policy.read().await;
+        policy
+            .hotpatch
+            .kernel_livepatch
+            .iter()
+            .filter(|t| t.enabled)
+            .cloned()
+            .collect()
+    };
+
+    // Always remove existing modules first, even if new targets list is empty.
+    {
+        let mut mgr = shared.livepatch_mgr.lock().await;
+        mgr.remove_all().await;
+    }
+
+    if targets.is_empty() {
+        return KernelLivepatchReloadResult {
+            success: true,
+            message: "no enabled kernel livepatch targets".to_string(),
+            module_name: None,
+        };
+    }
+
+    if let Err(e) = livepatch::check_livepatch_support().await {
+        return KernelLivepatchReloadResult {
+            success: false,
+            message: format!("livepatch not supported: {e:#}"),
+            module_name: None,
+        };
+    }
+
+    let mut mgr = shared.livepatch_mgr.lock().await;
+    match mgr.apply(&targets).await {
+        Ok(name) => KernelLivepatchReloadResult {
+            success: true,
+            message: format!("kernel livepatch applied: {} func(s)", targets.len()),
+            module_name: Some(name),
+        },
+        Err(e) => {
+            warn!("kernel livepatch sync failed: {e:#}");
+            KernelLivepatchReloadResult {
+                success: false,
+                message: format!("kernel livepatch failed: {e:#}"),
+                module_name: None,
+            }
+        }
+    }
+}
+
+async fn api_reload_kernel_livepatch(
+    State(shared): State<Shared>,
+) -> Json<KernelLivepatchReloadResult> {
+    Json(sync_kernel_livepatches(&shared).await)
 }
 
 // ── File Event Detail API ──
