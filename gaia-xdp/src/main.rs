@@ -662,15 +662,42 @@ fn attach_agents(bpf: &mut Ebpf) -> Result<()> {
 }
 
 /// Find the root cgroup v2 mount point.
+///
+/// Supports three common configurations:
+/// 1. Pure cgroup v2: `/sys/fs/cgroup` is a cgroup2 mount.
+/// 2. Hybrid mode:   `/sys/fs/cgroup/unified` is the cgroup2 mount.
+/// 3. Fallback:      parse `/proc/mounts` for any `cgroup2` type entry.
 fn find_cgroup_root() -> Result<PathBuf> {
-    // Try common cgroup v2 paths
-    for path in &["/sys/fs/cgroup"] {
+    // Well-known candidate paths (pure v2 first, then hybrid unified mount)
+    for path in &["/sys/fs/cgroup", "/sys/fs/cgroup/unified"] {
         let p = Path::new(path);
         if p.join("cgroup.controllers").exists() {
             return Ok(p.to_path_buf());
         }
     }
-    anyhow::bail!("could not find cgroup v2 root mount point")
+
+    // Fallback: scan /proc/mounts for a cgroup2 filesystem
+    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+        for line in mounts.lines() {
+            // Format: <device> <mountpoint> <fstype> <options> <dump> <pass>
+            let mut parts = line.splitn(6, ' ');
+            let _device = parts.next();
+            let mountpoint = parts.next().unwrap_or("");
+            let fstype = parts.next().unwrap_or("");
+            if fstype == "cgroup2" {
+                let p = Path::new(mountpoint);
+                if p.join("cgroup.controllers").exists() {
+                    return Ok(p.to_path_buf());
+                }
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "could not find cgroup v2 root mount point; \
+         ensure cgroup v2 is mounted (e.g. `mount -t cgroup2 none /sys/fs/cgroup` \
+         or set systemd.unified_cgroup_hierarchy=1 in kernel cmdline)"
+    )
 }
 
 fn attach_tracepoint(bpf: &mut Ebpf, prog_name: &str, category: &str, name: &str) -> Result<()> {
