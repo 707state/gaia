@@ -50,7 +50,10 @@ fn configure_webui_rerun(webui_dir: &Path) -> anyhow::Result<()> {
         "vite.config.ts",
         "index.html",
     ] {
-        println!("cargo:rerun-if-changed={}", webui_dir.join(relative).display());
+        println!(
+            "cargo:rerun-if-changed={}",
+            webui_dir.join(relative).display()
+        );
     }
 
     let src_dir = webui_dir.join("src");

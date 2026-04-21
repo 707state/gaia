@@ -1,0 +1,14 @@
+enabled = true
+provider = "open_ai"
+base_url = ""
+model = "gpt-4o-mini"
+api_key = ""
+analysis_prompt = ""
+
+[wechat]
+enabled = true
+base_url = ""
+cred_path = ""
+subscribers_path = "gaia-notify-subscribers.json"
+bot_name = "ClawBot"
+status_path = "gaia-notify-state.json"

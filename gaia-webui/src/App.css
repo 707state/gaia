@@ -2423,6 +2423,19 @@ code.cmdline {
   cursor: not-allowed;
 }
 
+.config-inline-group {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.config-inline-suffix {
+  font-size: 12px;
+  color: #64748b;
+  white-space: nowrap;
+}
+
 .ai-config-hint {
   font-size: 12px;
   color: #64748b;
@@ -2430,4 +2443,108 @@ code.cmdline {
   padding: 8px 12px;
   border-radius: 8px;
   line-height: 1.5;
+}
+
+.config-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.wechat-login-card {
+  border: 1px solid #dbeafe;
+  background: linear-gradient(180deg, #f8fbff 0%, #f2f7ff 100%);
+  border-radius: 14px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.wechat-login-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.wechat-login-header h4 {
+  margin: 0 0 4px;
+  font-size: 15px;
+  color: #0f172a;
+}
+
+.wechat-login-header p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #64748b;
+}
+
+.wechat-login-meta {
+  font-size: 13px;
+  color: #334155;
+  display: grid;
+  gap: 8px;
+}
+
+.wechat-qr-block {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.wechat-qr-image {
+  width: 220px;
+  height: 220px;
+  border-radius: 12px;
+  border: 1px solid #cbd5e1;
+  background: #fff;
+  padding: 12px;
+}
+
+.wechat-qr-meta {
+  flex: 1;
+  min-width: 220px;
+  display: grid;
+  gap: 10px;
+  font-size: 13px;
+  color: #334155;
+}
+
+.wechat-qr-meta p {
+  margin: 0;
+  line-height: 1.6;
+}
+
+.wechat-qr-url {
+  display: block;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #eaf2ff;
+  color: #1e3a8a;
+  word-break: break-all;
+  font-size: 12px;
+}
+
+.wechat-login-error {
+  font-size: 12px;
+  color: #991b1b;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  padding: 10px 12px;
+  border-radius: 10px;
+}
+
+@media (max-width: 720px) {
+  .wechat-login-header {
+    flex-direction: column;
+  }
+
+  .wechat-qr-image {
+    width: min(220px, 100%);
+    height: auto;
+  }
 }

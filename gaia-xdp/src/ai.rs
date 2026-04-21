@@ -1,3 +1,14 @@
+use futures_util::StreamExt as FuturesStreamExt;
+use qrcode::{QrCode, render::svg};
+use rig::{
+    agent::MultiTurnStreamItem,
+    client::{CompletionClient, Nothing},
+    completion::message::Message,
+    providers::{ollama, openai},
+    streaming::{StreamedAssistantContent, StreamingChat},
+};
+use tokio::{io::AsyncWriteExt, net::UnixStream};
+
 use super::*;
 
 pub(crate) fn load_ai_config(config_path: &Path) -> AiConfig {
@@ -8,6 +19,43 @@ pub(crate) fn load_ai_config(config_path: &Path) -> AiConfig {
     match fs::read_to_string(&path) {
         Ok(raw) => toml::from_str::<AiConfig>(&raw).unwrap_or_default(),
         Err(_) => AiConfig::default(),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub(crate) struct WechatBotStatus {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    logged_in: bool,
+    #[serde(default)]
+    needs_qr_scan: bool,
+    #[serde(default)]
+    qr_url: Option<String>,
+    #[serde(default)]
+    last_error: Option<String>,
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
+}
+
+fn notify_status_path(config_path: &Path) -> PathBuf {
+    let stem = config_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("gaia");
+    let parent = config_path.parent().unwrap_or(Path::new("."));
+    parent.join(format!("{stem}-notify-state.json"))
+}
+
+pub(crate) fn load_wechat_bot_status(config_path: &Path) -> WechatBotStatus {
+    let path = notify_status_path(config_path);
+    match fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str::<WechatBotStatus>(&raw).unwrap_or_default(),
+        Err(_) => WechatBotStatus::default(),
     }
 }
 
@@ -51,6 +99,14 @@ pub(crate) struct AiConfigUpdate {
     model: Option<String>,
     #[serde(default)]
     api_key: Option<String>,
+    #[serde(default)]
+    analysis_interval_hours: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct TriggerAnalysisRequest {
+    #[serde(default)]
+    source: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -75,19 +131,62 @@ pub(crate) async fn api_ai_get_config(State(shared): State<Shared>) -> Json<AiCo
     Json(safe)
 }
 
+pub(crate) async fn api_ai_get_wechat_status(
+    State(shared): State<Shared>,
+) -> Json<WechatBotStatus> {
+    Json(load_wechat_bot_status(&shared.config_path))
+}
+
+pub(crate) async fn api_ai_get_wechat_qr(State(shared): State<Shared>) -> Response {
+    let status = load_wechat_bot_status(&shared.config_path);
+    let Some(qr_url) = status.qr_url.as_deref() else {
+        return (StatusCode::NOT_FOUND, "wechat qr url not available").into_response();
+    };
+
+    let code = match QrCode::new(qr_url.as_bytes()) {
+        Ok(code) => code,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to generate qr code: {err}"),
+            )
+                .into_response();
+        }
+    };
+
+    let image = code
+        .render::<svg::Color<'_>>()
+        .min_dimensions(256, 256)
+        .quiet_zone(true)
+        .build();
+
+    ([(header::CONTENT_TYPE, "image/svg+xml")], image).into_response()
+}
+
 pub(crate) async fn api_ai_update_config(
     State(shared): State<Shared>,
     Json(update): Json<AiConfigUpdate>,
 ) -> Json<AiConfig> {
     let mut cfg = shared.ai_config.write().await;
-    if let Some(v) = update.enabled { cfg.enabled = v; }
-    if let Some(v) = update.provider { cfg.provider = v; }
-    if let Some(v) = update.base_url { cfg.base_url = v; }
-    if let Some(v) = update.model { cfg.model = v; }
+    if let Some(v) = update.enabled {
+        cfg.enabled = v;
+    }
+    if let Some(v) = update.provider {
+        cfg.provider = v;
+    }
+    if let Some(v) = update.base_url {
+        cfg.base_url = v;
+    }
+    if let Some(v) = update.model {
+        cfg.model = v;
+    }
     if let Some(v) = update.api_key {
         if v != "••••••••" {
             cfg.api_key = v;
         }
+    }
+    if let Some(v) = update.analysis_interval_hours {
+        cfg.analysis_interval_hours = v;
     }
     let mut safe = cfg.clone();
     drop(cfg);
@@ -96,6 +195,47 @@ pub(crate) async fn api_ai_update_config(
         safe.api_key = "••••••••".to_string();
     }
     Json(safe)
+}
+
+pub(crate) async fn api_ai_trigger_analysis(
+    State(shared): State<Shared>,
+    Json(req): Json<TriggerAnalysisRequest>,
+) -> Response {
+    let source = req.source.unwrap_or_else(|| "webui_manual".to_string());
+    let payload = serde_json::json!({
+        "action": "analyze_now",
+        "source": source,
+    })
+    .to_string();
+
+    let mut stream = match UnixStream::connect(&shared.notify_control_socket).await {
+        Ok(stream) => stream,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "gaia-notify control socket unavailable ({}): {err}",
+                    shared.notify_control_socket.display()
+                ),
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(err) = stream.write_all(format!("{payload}\n").as_bytes()).await {
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!("failed to send analysis command to gaia-notify: {err}"),
+        )
+            .into_response();
+    }
+
+    Json(serde_json::json!({
+        "ok": true,
+        "message": "analysis command sent",
+        "source": source,
+    }))
+    .into_response()
 }
 
 async fn build_system_prompt(shared: &Shared, include_context: bool) -> String {
@@ -134,7 +274,14 @@ When referencing events, cite specific PIDs, process names, and timestamps where
         .alerts
         .iter()
         .take(10)
-        .map(|a| format!("[{}] {}: {}", a.level.to_uppercase(), a.event.comm, a.reason))
+        .map(|a| {
+            format!(
+                "[{}] {}: {}",
+                a.level.to_uppercase(),
+                a.event.comm,
+                a.reason
+            )
+        })
         .collect();
 
     let counters: Vec<String> = state
@@ -152,18 +299,39 @@ When referencing events, cite specific PIDs, process names, and timestamps where
         ## Recent Alerts (newest first)\n{}\n\n\
         ## Recent Events (newest first)\n{}",
         counters.join(", "),
-        if recent_alerts.is_empty() { "None".to_string() } else { recent_alerts.join("\n") },
-        if recent_events.is_empty() { "None".to_string() } else { recent_events.join("\n") },
+        if recent_alerts.is_empty() {
+            "None".to_string()
+        } else {
+            recent_alerts.join("\n")
+        },
+        if recent_events.is_empty() {
+            "None".to_string()
+        } else {
+            recent_events.join("\n")
+        },
     )
 }
 
-fn resolve_base_url(cfg: &AiConfig) -> String {
-    if !cfg.base_url.is_empty() {
-        return cfg.base_url.trim_end_matches('/').to_string();
-    }
-    match cfg.provider {
-        AiProvider::Ollama => "http://localhost:11434".to_string(),
-        AiProvider::OpenAi | AiProvider::Custom => "https://api.openai.com".to_string(),
+fn resolve_base_url_for_rig(cfg: &AiConfig) -> String {
+    let raw = if !cfg.base_url.is_empty() {
+        cfg.base_url.trim_end_matches('/').to_string()
+    } else {
+        match cfg.provider {
+            AiProvider::Ollama => "http://localhost:11434".to_string(),
+            AiProvider::OpenAi | AiProvider::Custom => "https://api.openai.com".to_string(),
+        }
+    };
+    // rig's OpenAI client appends /v1 automatically; strip it if already present.
+    raw.trim_end_matches("/v1").to_string()
+}
+
+/// Convert a `ChatMessage` role/content pair into a rig `Message`.
+/// Returns `None` for "system" messages (handled via preamble).
+fn chat_msg_to_rig(msg: &ChatMessage) -> Option<Message> {
+    match msg.role.as_str() {
+        "user" => Some(Message::user(msg.content.clone())),
+        "assistant" => Some(Message::assistant(msg.content.clone())),
+        _ => None,
     }
 }
 
@@ -184,106 +352,100 @@ pub(crate) async fn api_ai_chat(
             .into_response();
     }
 
+    // Find the last user message to use as the prompt; everything before it is history.
+    let last_user_idx = req
+        .messages
+        .iter()
+        .rposition(|m| m.role == "user");
+    let Some(user_idx) = last_user_idx else {
+        return (StatusCode::BAD_REQUEST, "no user message in request").into_response();
+    };
+
+    let prompt_text = req.messages[user_idx].content.clone();
+    let history: Vec<Message> = req.messages[..user_idx]
+        .iter()
+        .filter_map(chat_msg_to_rig)
+        .collect();
+
     let system_prompt = build_system_prompt(&shared, req.include_context).await;
-    let mut messages: Vec<serde_json::Value> = vec![serde_json::json!({
-        "role": "system",
-        "content": system_prompt,
-    })];
-    for msg in &req.messages {
-        messages.push(serde_json::json!({
-            "role": msg.role,
-            "content": msg.content,
-        }));
-    }
+    let base_url = resolve_base_url_for_rig(&cfg);
 
-    let base_url = resolve_base_url(&cfg);
-    let endpoint = match cfg.provider {
-        AiProvider::Ollama => format!("{base_url}/api/chat"),
-        _ => format!("{base_url}/v1/chat/completions"),
-    };
-    let body = serde_json::json!({
-        "model": cfg.model,
-        "messages": messages,
-        "stream": true,
-    });
-
-    let client = reqwest::Client::new();
-    let mut req_builder = client
-        .post(&endpoint)
-        .header("Content-Type", "application/json")
-        .json(&body);
-
-    if !cfg.api_key.is_empty() {
-        req_builder = req_builder.header("Authorization", format!("Bearer {}", cfg.api_key));
-    }
-
-    let http_resp = match req_builder.send().await {
-        Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_GATEWAY, format!("LLM API request failed: {e}")).into_response(),
-    };
-
-    if !http_resp.status().is_success() {
-        let status = http_resp.status();
-        let body_text = http_resp.text().await.unwrap_or_default();
-        return (StatusCode::BAD_GATEWAY, format!("LLM API error {status}: {body_text}")).into_response();
-    }
-
-    let is_ollama = cfg.provider == AiProvider::Ollama;
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
 
+    // Build the rig stream in a spawned task so we can return the SSE response immediately.
     tokio::spawn(async move {
-        let mut byte_stream = http_resp.bytes_stream();
-        let mut buffer = String::new();
+        let send = |tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+                    delta: String,
+                    done: bool| {
+            let payload = serde_json::json!({ "delta": delta, "done": done });
+            let _ = tx.try_send(Ok(Event::default().data(payload.to_string())));
+        };
 
-        while let Some(chunk) = futures_util::StreamExt::next(&mut byte_stream).await {
-            let chunk = match chunk {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(Ok(Event::default().data(
-                        serde_json::json!({"error": e.to_string()}).to_string(),
-                    ))).await;
-                    return;
-                }
-            };
-
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-            while let Some(newline_pos) = buffer.find('\n') {
-                let line = buffer[..newline_pos].trim().to_string();
-                buffer = buffer[newline_pos + 1..].to_string();
-
-                if line.is_empty() || line == "data: [DONE]" {
-                    continue;
-                }
-
-                let json_str = if line.starts_with("data: ") { &line[6..] } else { &line };
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
-                    let (delta, done) = if is_ollama {
-                        let content = val["message"]["content"].as_str().unwrap_or("").to_string();
-                        let done = val["done"].as_bool().unwrap_or(false);
-                        (content, done)
-                    } else {
-                        let content = val["choices"][0]["delta"]["content"].as_str().unwrap_or("").to_string();
-                        let done = val["choices"][0]["finish_reason"]
-                            .as_str()
-                            .map(|r| r == "stop")
-                            .unwrap_or(false);
-                        (content, done)
-                    };
-
-                    if !delta.is_empty() || done {
-                        let payload = serde_json::json!({ "delta": delta, "done": done });
-                        if tx.send(Ok(Event::default().data(payload.to_string()))).await.is_err() {
+        macro_rules! drain_stream {
+            ($stream:expr) => {{
+                let mut s = $stream;
+                while let Some(item) = FuturesStreamExt::next(&mut s).await {
+                    match item {
+                        Ok(MultiTurnStreamItem::StreamAssistantItem(
+                            StreamedAssistantContent::Text(t),
+                        )) => {
+                            send(&tx, t.text, false);
+                        }
+                        Ok(MultiTurnStreamItem::FinalResponse(_)) => {
+                            send(&tx, String::new(), true);
+                            return;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            send(&tx, format!("[stream error: {e}]"), true);
                             return;
                         }
                     }
                 }
-            }
+                send(&tx, String::new(), true);
+            }};
         }
 
-        let _ = tx.send(Ok(Event::default().data(
-            serde_json::json!({"delta": "", "done": true}).to_string(),
-        ))).await;
+        match cfg.provider {
+            AiProvider::Ollama => {
+                let mut builder = ollama::Client::builder().api_key(Nothing);
+                if !base_url.is_empty() {
+                    builder = builder.base_url(&base_url);
+                }
+                let client = match builder.build() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        send(&tx, format!("[rig build error: {e}]"), true);
+                        return;
+                    }
+                };
+                let agent = client
+                    .agent(cfg.model.as_str())
+                    .preamble(&system_prompt)
+                    .build();
+                let stream = agent.stream_chat(&prompt_text, history).await;
+                drain_stream!(stream);
+            }
+            AiProvider::OpenAi | AiProvider::Custom => {
+                let client = match openai::Client::builder()
+                    .api_key(cfg.api_key.trim())
+                    .base_url(&base_url)
+                    .build()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        send(&tx, format!("[rig build error: {e}]"), true);
+                        return;
+                    }
+                };
+                let agent = client
+                    .agent(cfg.model.as_str())
+                    .preamble(&system_prompt)
+                    .build();
+                let stream = agent.stream_chat(&prompt_text, history).await;
+                drain_stream!(stream);
+            }
+        }
     });
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -297,7 +459,9 @@ pub(crate) async fn api_ai_events(State(shared): State<Shared>) -> Response {
     let stream = TokioStreamExt::filter_map(BroadcastStream::new(rx), |result| match result {
         Ok(notification) => {
             let data = serde_json::to_string(&notification).unwrap_or_default();
-            Some(Ok::<Event, Infallible>(Event::default().event("alert").data(data)))
+            Some(Ok::<Event, Infallible>(
+                Event::default().event("alert").data(data),
+            ))
         }
         Err(_) => None,
     });

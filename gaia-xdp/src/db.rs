@@ -229,59 +229,97 @@ mod tests {
         // Insert 10 events: 5 process, 5 privilege
         for i in 0u32..10 {
             let kind = if i % 2 == 0 { "process" } else { "privilege" };
-            db.insert_event(make_record(kind, 1000 + i, (i as u64) * 1000 + 1_700_000_000_000)).await.unwrap();
+            db.insert_event(make_record(
+                kind,
+                1000 + i,
+                (i as u64) * 1000 + 1_700_000_000_000,
+            ))
+            .await
+            .unwrap();
         }
 
         // Query all
-        let page = db.query_events(EventFilter {
-            page_size: 20,
-            ..Default::default()
-        }).await.unwrap();
+        let page = db
+            .query_events(EventFilter {
+                page_size: 20,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert_eq!(page.total, 10, "expected 10 total");
         assert_eq!(page.events.len(), 10);
         println!("total=10 ✓");
 
         // Filter by kind
-        let page2 = db.query_events(EventFilter {
-            kind: Some("process".into()),
-            page_size: 20,
-            ..Default::default()
-        }).await.unwrap();
+        let page2 = db
+            .query_events(EventFilter {
+                kind: Some("process".into()),
+                page_size: 20,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert_eq!(page2.total, 5, "expected 5 process events");
         assert!(page2.events.iter().all(|e| e.kind == "process"));
         println!("filter kind=process → 5 rows ✓");
 
         // Pagination
-        let p0 = db.query_events(EventFilter { page: 0, page_size: 3, ..Default::default() }).await.unwrap();
-        let p1 = db.query_events(EventFilter { page: 1, page_size: 3, ..Default::default() }).await.unwrap();
+        let p0 = db
+            .query_events(EventFilter {
+                page: 0,
+                page_size: 3,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let p1 = db
+            .query_events(EventFilter {
+                page: 1,
+                page_size: 3,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert_eq!(p0.events.len(), 3);
         assert_eq!(p1.events.len(), 3);
         // Pages must not overlap
         let ids0: Vec<i64> = p0.events.iter().map(|e| e.id).collect();
         let ids1: Vec<i64> = p1.events.iter().map(|e| e.id).collect();
-        assert!(ids0.iter().all(|id| !ids1.contains(id)), "pages must not overlap");
+        assert!(
+            ids0.iter().all(|id| !ids1.contains(id)),
+            "pages must not overlap"
+        );
         println!("pagination page0={ids0:?} page1={ids1:?} ✓");
 
         // Time range filter
         let since = 1_700_000_003_000i64; // after first 3 events
-        let page3 = db.query_events(EventFilter {
-            since_ms: Some(since),
-            page_size: 20,
-            ..Default::default()
-        }).await.unwrap();
+        let page3 = db
+            .query_events(EventFilter {
+                since_ms: Some(since),
+                page_size: 20,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert!(page3.total <= 7, "expected ≤7 events after since_ms");
         assert!(page3.events.iter().all(|e| e.ts_ms >= since));
         println!("time range since={since} → {} rows ✓", page3.total);
 
         // Network event
         let mut net_rec = make_record("network", 2000, 1_700_000_099_000);
-        net_rec.network = Some(NetworkView { address: "1.2.3.4".into(), port: 443 });
+        net_rec.network = Some(NetworkView {
+            address: "1.2.3.4".into(),
+            port: 443,
+        });
         db.insert_event(net_rec).await.unwrap();
-        let net_page = db.query_events(EventFilter {
-            kind: Some("network".into()),
-            page_size: 5,
-            ..Default::default()
-        }).await.unwrap();
+        let net_page = db
+            .query_events(EventFilter {
+                kind: Some("network".into()),
+                page_size: 5,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         assert_eq!(net_page.total, 1);
         let ne = &net_page.events[0];
         assert_eq!(ne.net_addr.as_deref(), Some("1.2.3.4"));

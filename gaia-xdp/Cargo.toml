@@ -20,6 +20,8 @@ tokio = { workspace = true, features = [
     "rt",
     "rt-multi-thread",
     "net",
+    "io-util",
+    "fs",
     "process",
     "signal",
     "time",
@@ -39,6 +41,10 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
 tokio-rusqlite = "0.5"
 rusqlite = { version = "0.31", features = ["bundled"] }
+wechatbot = "0.3.1"
+native-tls = { version = "0.2", features = ["vendored"] }
+qrcode = "0.14"
+rig-core = "0.35"
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }

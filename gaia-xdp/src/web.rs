@@ -43,29 +43,81 @@ pub(crate) async fn run_http_server(shared: Shared, addr: String) -> Result<()> 
 
     let app = Router::new()
         .route("/api/v1/state", get(api_state))
-        .route("/api/v1/config", get(api_get_config).post(api_update_config))
-        .route("/api/v1/config/rate-limit", get(api_get_rate_limits).post(api_add_rate_limit).put(api_update_rate_limit))
-        .route("/api/v1/config/rate-limit/{index}", axum::routing::delete(api_delete_rate_limit))
-        .route("/api/v1/config/hotpatch", get(api_get_hotpatch).post(api_add_hotpatch).put(api_update_hotpatch))
-        .route("/api/v1/config/hotpatch/{index}", axum::routing::delete(api_delete_hotpatch))
+        .route(
+            "/api/v1/config",
+            get(api_get_config).post(api_update_config),
+        )
+        .route(
+            "/api/v1/config/rate-limit",
+            get(api_get_rate_limits)
+                .post(api_add_rate_limit)
+                .put(api_update_rate_limit),
+        )
+        .route(
+            "/api/v1/config/rate-limit/{index}",
+            axum::routing::delete(api_delete_rate_limit),
+        )
+        .route(
+            "/api/v1/config/hotpatch",
+            get(api_get_hotpatch)
+                .post(api_add_hotpatch)
+                .put(api_update_hotpatch),
+        )
+        .route(
+            "/api/v1/config/hotpatch/{index}",
+            axum::routing::delete(api_delete_hotpatch),
+        )
         .route("/api/v1/config/toggle", post(api_toggle_item))
-        .route("/api/v1/process/{pid}", get(crate::process::api_process_detail))
+        .route(
+            "/api/v1/process/{pid}",
+            get(crate::process::api_process_detail),
+        )
         .route("/api/v1/upload-lib", post(api_upload_lib))
         .route("/api/v1/reload-hotpatch", post(api_reload_hotpatch))
-        .route("/api/v1/config/kernel-livepatch", get(api_get_kernel_livepatch).post(api_add_kernel_livepatch))
-        .route("/api/v1/config/kernel-livepatch/{index}", axum::routing::delete(api_delete_kernel_livepatch).put(api_update_kernel_livepatch))
-        .route("/api/v1/kernel-livepatch/status", get(api_kernel_livepatch_status))
-        .route("/api/v1/kernel-livepatch/reload", post(api_reload_kernel_livepatch))
+        .route(
+            "/api/v1/config/kernel-livepatch",
+            get(api_get_kernel_livepatch).post(api_add_kernel_livepatch),
+        )
+        .route(
+            "/api/v1/config/kernel-livepatch/{index}",
+            axum::routing::delete(api_delete_kernel_livepatch).put(api_update_kernel_livepatch),
+        )
+        .route(
+            "/api/v1/kernel-livepatch/status",
+            get(api_kernel_livepatch_status),
+        )
+        .route(
+            "/api/v1/kernel-livepatch/reload",
+            post(api_reload_kernel_livepatch),
+        )
         .route("/api/v1/file-event/detail", get(api_file_event_detail))
         .route("/api/v1/history/events", get(api_history_events))
-        .route("/api/v1/ai/config", get(crate::ai::api_ai_get_config).post(crate::ai::api_ai_update_config))
+        .route(
+            "/api/v1/ai/config",
+            get(crate::ai::api_ai_get_config).post(crate::ai::api_ai_update_config),
+        )
         .route("/api/v1/ai/chat", post(crate::ai::api_ai_chat))
         .route("/api/v1/ai/events", get(crate::ai::api_ai_events))
+        .route(
+            "/api/v1/ai/analyze",
+            post(crate::ai::api_ai_trigger_analysis),
+        )
+        .route(
+            "/api/v1/ai/wechat/status",
+            get(crate::ai::api_ai_get_wechat_status),
+        )
+        .route(
+            "/api/v1/ai/wechat/qr.svg",
+            get(crate::ai::api_ai_get_wechat_qr),
+        )
         .with_state(shared)
         .layer(cors)
         .fallback(embedded_webui_handler);
 
-    info!("serving embedded WebUI ({} files)", WebAssets::iter().count());
+    info!(
+        "serving embedded WebUI ({} files)",
+        WebAssets::iter().count()
+    );
 
     let listener = TcpListener::bind(&addr)
         .await
@@ -89,7 +141,11 @@ async fn embedded_webui_handler(uri: Uri) -> Response {
             ([(header::CONTENT_TYPE, mime)], content.data.to_vec()).into_response()
         }
         None => match WebAssets::get("index.html") {
-            Some(index) => ([(header::CONTENT_TYPE, "text/html; charset=utf-8".to_string())], index.data.to_vec()).into_response(),
+            Some(index) => (
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8".to_string())],
+                index.data.to_vec(),
+            )
+                .into_response(),
             None => (StatusCode::NOT_FOUND, "WebUI not embedded").into_response(),
         },
     }
@@ -115,7 +171,11 @@ fn guess_mime(path: &str) -> String {
 async fn api_state(State(shared): State<Shared>) -> Json<Snapshot> {
     let state = shared.runtime.read().await;
     let hotpatch_active = shared.hotpatch_active.lock().map(|v| *v).unwrap_or(false);
-    let symbol_resolver = shared.symbol_resolver_ok.lock().map(|v| *v).unwrap_or(false);
+    let symbol_resolver = shared
+        .symbol_resolver_ok
+        .lock()
+        .map(|v| *v)
+        .unwrap_or(false);
 
     Json(Snapshot {
         features: FeatureStatus {
@@ -139,13 +199,26 @@ async fn api_get_config(State(shared): State<Shared>) -> Json<MonitorPolicy> {
     Json(policy.clone())
 }
 
-async fn api_update_config(State(shared): State<Shared>, Json(update): Json<ConfigUpdate>) -> Json<MonitorPolicy> {
+async fn api_update_config(
+    State(shared): State<Shared>,
+    Json(update): Json<ConfigUpdate>,
+) -> Json<MonitorPolicy> {
     let mut policy = shared.policy.write().await;
-    if let Some(v) = update.sensitive_prefixes { policy.sensitive_prefixes = v; }
-    if let Some(v) = update.monitored_services { policy.monitored_services = v; }
-    if let Some(v) = update.exec_whitelist_prefixes { policy.exec_whitelist_prefixes = v; }
-    if let Some(ref v) = update.blocked_ports { policy.blocked_ports = v.clone(); }
-    if let Some(v) = update.baseline_thresholds { policy.baseline_thresholds = v; }
+    if let Some(v) = update.sensitive_prefixes {
+        policy.sensitive_prefixes = v;
+    }
+    if let Some(v) = update.monitored_services {
+        policy.monitored_services = v;
+    }
+    if let Some(v) = update.exec_whitelist_prefixes {
+        policy.exec_whitelist_prefixes = v;
+    }
+    if let Some(ref v) = update.blocked_ports {
+        policy.blocked_ports = v.clone();
+    }
+    if let Some(v) = update.baseline_thresholds {
+        policy.baseline_thresholds = v;
+    }
     let snapshot = policy.clone();
     drop(policy);
     if update.blocked_ports.is_some() {
@@ -160,7 +233,10 @@ async fn api_get_rate_limits(State(shared): State<Shared>) -> Json<Vec<RateLimit
     Json(policy.rate_limit_rules.clone())
 }
 
-async fn api_add_rate_limit(State(shared): State<Shared>, Json(rule): Json<RateLimitRule>) -> Json<Vec<RateLimitRule>> {
+async fn api_add_rate_limit(
+    State(shared): State<Shared>,
+    Json(rule): Json<RateLimitRule>,
+) -> Json<Vec<RateLimitRule>> {
     let mut policy = shared.policy.write().await;
     policy.rate_limit_rules.push(rule);
     let rules = policy.rate_limit_rules.clone();
@@ -205,7 +281,10 @@ async fn api_get_hotpatch(State(shared): State<Shared>) -> Json<Vec<HotpatchTarg
     Json(policy.hotpatch.targets.clone())
 }
 
-async fn api_add_hotpatch(State(shared): State<Shared>, Json(target): Json<HotpatchTarget>) -> Json<Vec<HotpatchTarget>> {
+async fn api_add_hotpatch(
+    State(shared): State<Shared>,
+    Json(target): Json<HotpatchTarget>,
+) -> Json<Vec<HotpatchTarget>> {
     let mut policy = shared.policy.write().await;
     policy.hotpatch.targets.push(target);
     let targets = policy.hotpatch.targets.clone();
@@ -275,7 +354,9 @@ async fn api_delete_hotpatch(
     Json(targets)
 }
 
-async fn api_upload_lib(mut multipart: Multipart) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+async fn api_upload_lib(
+    mut multipart: Multipart,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let mut file_data: Option<Vec<u8>> = None;
     let mut file_name: Option<String> = None;
 
@@ -289,7 +370,8 @@ async fn api_upload_lib(mut multipart: Multipart) -> Result<Json<serde_json::Val
         }
     }
 
-    let data = file_data.ok_or_else(|| (StatusCode::BAD_REQUEST, "missing 'file' field".to_string()))?;
+    let data =
+        file_data.ok_or_else(|| (StatusCode::BAD_REQUEST, "missing 'file' field".to_string()))?;
     let original_name = file_name.unwrap_or_else(|| "uploaded.so".to_string());
 
     let obj = match object::File::parse(data.as_slice()) {
@@ -301,27 +383,50 @@ async fn api_upload_lib(mut multipart: Multipart) -> Result<Json<serde_json::Val
     let elf_arch = match obj.architecture() {
         object::Architecture::Aarch64 => "aarch64",
         object::Architecture::X86_64 => "x86_64",
-        other => return Err((StatusCode::BAD_REQUEST, format!("unsupported ELF architecture: {other:?}"))),
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("unsupported ELF architecture: {other:?}"),
+            ));
+        }
     };
     if elf_arch != host_arch {
-        return Err((StatusCode::BAD_REQUEST, format!("architecture mismatch: uploaded .so is {elf_arch} but host is {host_arch}")));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("architecture mismatch: uploaded .so is {elf_arch} but host is {host_arch}"),
+        ));
     }
     if obj.kind() != object::ObjectKind::Dynamic {
-        return Err((StatusCode::BAD_REQUEST, format!("uploaded file is not a shared library (got {:?}, expected ET_DYN)", obj.kind())));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "uploaded file is not a shared library (got {:?}, expected ET_DYN)",
+                obj.kind()
+            ),
+        ));
     }
 
     let lib_dir = PathBuf::from("/tmp/gaia-libs");
     if let Err(e) = fs::create_dir_all(&lib_dir) {
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("create lib dir: {e}")));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("create lib dir: {e}"),
+        ));
     }
     let safe_name = original_name
         .rsplit('/')
         .next()
         .unwrap_or("uploaded.so")
-        .replace(|c: char| !c.is_alphanumeric() && c != '.' && c != '_' && c != '-', "_");
+        .replace(
+            |c: char| !c.is_alphanumeric() && c != '.' && c != '_' && c != '-',
+            "_",
+        );
     let dest = lib_dir.join(&safe_name);
     if let Err(e) = fs::write(&dest, &data) {
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("write file: {e}")));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write file: {e}"),
+        ));
     }
     #[cfg(unix)]
     {
@@ -330,7 +435,12 @@ async fn api_upload_lib(mut multipart: Multipart) -> Result<Json<serde_json::Val
     }
 
     let path_str = dest.to_string_lossy().to_string();
-    info!("uploaded library saved: {} ({} bytes, arch={})", path_str, data.len(), elf_arch);
+    info!(
+        "uploaded library saved: {} ({} bytes, arch={})",
+        path_str,
+        data.len(),
+        elf_arch
+    );
 
     Ok(Json(serde_json::json!({
         "path": path_str,
@@ -627,7 +737,9 @@ async fn api_file_event_detail(
     };
 
     let policy = shared.policy.read().await;
-    let is_sensitive = policy.sensitive_prefixes.iter()
+    let is_sensitive = policy
+        .sensitive_prefixes
+        .iter()
         .filter(|p| p.enabled)
         .any(|p| path_str.starts_with(&p.value));
     drop(policy);
@@ -698,24 +810,45 @@ fn read_file_metadata(path: &str) -> Option<FileMetadata> {
 
 fn format_unix_permissions(mode: u32) -> String {
     let chars: Vec<char> = [
-        (0o400, 'r'), (0o200, 'w'), (0o100, 'x'),
-        (0o040, 'r'), (0o020, 'w'), (0o010, 'x'),
-        (0o004, 'r'), (0o002, 'w'), (0o001, 'x'),
+        (0o400, 'r'),
+        (0o200, 'w'),
+        (0o100, 'x'),
+        (0o040, 'r'),
+        (0o020, 'w'),
+        (0o010, 'x'),
+        (0o004, 'r'),
+        (0o002, 'w'),
+        (0o001, 'x'),
     ]
     .iter()
     .map(|(bit, ch)| if mode & bit != 0 { *ch } else { '-' })
     .collect();
-    format!("{}{}{}{}{}{}{}{}{}{}",
-        if mode & 0o170000 == 0o040000 { 'd' } else if mode & 0o170000 == 0o120000 { 'l' } else { '-' },
-        chars[0], chars[1], chars[2],
-        chars[3], chars[4], chars[5],
-        chars[6], chars[7], chars[8],
+    format!(
+        "{}{}{}{}{}{}{}{}{}{}",
+        if mode & 0o170000 == 0o040000 {
+            'd'
+        } else if mode & 0o170000 == 0o120000 {
+            'l'
+        } else {
+            '-'
+        },
+        chars[0],
+        chars[1],
+        chars[2],
+        chars[3],
+        chars[4],
+        chars[5],
+        chars[6],
+        chars[7],
+        chars[8],
     )
 }
 
 fn check_file_open_by_pid(pid: u32, target_path: &str) -> bool {
     let fd_dir = format!("/proc/{pid}/fd");
-    let Ok(entries) = fs::read_dir(&fd_dir) else { return false };
+    let Ok(entries) = fs::read_dir(&fd_dir) else {
+        return false;
+    };
     for entry in entries.flatten() {
         if let Ok(link_target) = fs::read_link(entry.path()) {
             if link_target.to_string_lossy() == target_path {
@@ -799,7 +932,11 @@ async fn api_history_events(
     };
     match shared.db.query_events(filter).await {
         Ok(page) => Json(page).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e:#}")).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("db error: {e:#}"),
+        )
+            .into_response(),
     }
 }
 

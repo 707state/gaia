@@ -14,14 +14,13 @@ use aya_ebpf::{
 // functions. It does NOT work with uprobes. For userspace function patching,
 // we use process_vm_writev in the userspace daemon instead.
 use gaia_xdp_common::{
-    HotpatchPidEntry, HotpatchRuleEntry, KernelEvent, RateLimitCounter, RateLimitEntry,
     EVENT_ACTION_ALERT, EVENT_ACTION_BLOCKED, EVENT_ACTION_ENTER, EVENT_ACTION_EXIT,
     EVENT_ACTION_RATE_LIMITED, EVENT_KIND_FILE_IO, EVENT_KIND_HOTPATCH, EVENT_KIND_NETWORK,
     EVENT_KIND_PRIVILEGE, EVENT_KIND_PROCESS, HOTPATCH_ACTION_MONITOR,
-    HOTPATCH_ACTION_OVERRIDE_RETURN, HOTPATCH_ACTION_REPLACE_FUNCTION,
-    HOTPATCH_ACTION_SKIP_CALL, MAX_HOTPATCH_PIDS,
-    MAX_HOTPATCH_RULES, MAX_RATE_LIMIT_COUNTERS, MAX_RATE_LIMIT_RULES, PROTOCOL_TCP,
-    RATE_ACTION_BLOCK,
+    HOTPATCH_ACTION_OVERRIDE_RETURN, HOTPATCH_ACTION_REPLACE_FUNCTION, HOTPATCH_ACTION_SKIP_CALL,
+    HotpatchPidEntry, HotpatchRuleEntry, KernelEvent, MAX_HOTPATCH_PIDS, MAX_HOTPATCH_RULES,
+    MAX_RATE_LIMIT_COUNTERS, MAX_RATE_LIMIT_RULES, PROTOCOL_TCP, RATE_ACTION_BLOCK,
+    RateLimitCounter, RateLimitEntry,
 };
 
 // ── Tracepoint field offsets ──
@@ -639,7 +638,13 @@ fn u64_to_ascii(mut val: u64, out: &mut [u8]) -> usize {
 #[cgroup_sock_addr(connect4)]
 pub fn cgroup_connect4(ctx: SockAddrContext) -> i32 {
     match try_block_port(&ctx) {
-        Ok(blocked) => if blocked { 0 } else { 1 },
+        Ok(blocked) => {
+            if blocked {
+                0
+            } else {
+                1
+            }
+        }
         Err(_) => 1, // allow on error
     }
 }
@@ -647,7 +652,13 @@ pub fn cgroup_connect4(ctx: SockAddrContext) -> i32 {
 #[cgroup_sock_addr(bind4)]
 pub fn cgroup_bind4(ctx: SockAddrContext) -> i32 {
     match try_block_port(&ctx) {
-        Ok(blocked) => if blocked { 0 } else { 1 },
+        Ok(blocked) => {
+            if blocked {
+                0
+            } else {
+                1
+            }
+        }
         Err(_) => 1, // allow on error
     }
 }
@@ -655,7 +666,13 @@ pub fn cgroup_bind4(ctx: SockAddrContext) -> i32 {
 #[cgroup_sock_addr(connect6)]
 pub fn cgroup_connect6(ctx: SockAddrContext) -> i32 {
     match try_block_port(&ctx) {
-        Ok(blocked) => if blocked { 0 } else { 1 },
+        Ok(blocked) => {
+            if blocked {
+                0
+            } else {
+                1
+            }
+        }
         Err(_) => 1, // allow on error
     }
 }
@@ -663,7 +680,13 @@ pub fn cgroup_connect6(ctx: SockAddrContext) -> i32 {
 #[cgroup_sock_addr(bind6)]
 pub fn cgroup_bind6(ctx: SockAddrContext) -> i32 {
     match try_block_port(&ctx) {
-        Ok(blocked) => if blocked { 0 } else { 1 },
+        Ok(blocked) => {
+            if blocked {
+                0
+            } else {
+                1
+            }
+        }
         Err(_) => 1, // allow on error
     }
 }

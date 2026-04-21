@@ -168,6 +168,18 @@ export type AiConfig = {
   base_url: string
   model: string
   api_key: string
+  analysis_interval_hours: number
+}
+
+export type WechatBotStatus = {
+  enabled: boolean
+  logged_in: boolean
+  needs_qr_scan: boolean
+  qr_url?: string | null
+  last_error?: string | null
+  account_id?: string | null
+  user_id?: string | null
+  updated_at?: string | null
 }
 
 export type ChatRole = 'user' | 'assistant' | 'system'

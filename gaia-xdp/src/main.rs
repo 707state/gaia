@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    convert::Infallible,
     fs,
     mem::size_of,
     net::Ipv4Addr,
@@ -7,14 +8,16 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use std::convert::Infallible;
 
 use anyhow::{Context, Result, anyhow};
 use axum::{
     Json, Router,
     extract::{Multipart, Path as AxumPath, State},
     http::{HeaderValue, Method, StatusCode, Uri, header},
-    response::{IntoResponse, Response, sse::{Event, KeepAlive, Sse}},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
 use aya::{
@@ -24,25 +27,24 @@ use aya::{
 };
 use clap::Parser;
 use gaia_xdp_common::{
-    EVENT_ACTION_ALERT, EVENT_ACTION_BLOCKED, EVENT_ACTION_RATE_LIMITED,
-    EVENT_KIND_FILE_IO, EVENT_KIND_HOTPATCH, EVENT_KIND_NETWORK, EVENT_KIND_PRIVILEGE,
-    EVENT_KIND_PROCESS, HOTPATCH_ACTION_MONITOR, HOTPATCH_ACTION_OVERRIDE_RETURN,
-    HOTPATCH_ACTION_REPLACE_FUNCTION, HOTPATCH_ACTION_SKIP_CALL,
-    HotpatchPidEntry, HotpatchRuleEntry, KernelEvent, RateLimitEntry,
+    EVENT_ACTION_ALERT, EVENT_ACTION_BLOCKED, EVENT_ACTION_RATE_LIMITED, EVENT_KIND_FILE_IO,
+    EVENT_KIND_HOTPATCH, EVENT_KIND_NETWORK, EVENT_KIND_PRIVILEGE, EVENT_KIND_PROCESS,
+    HOTPATCH_ACTION_MONITOR, HOTPATCH_ACTION_OVERRIDE_RETURN, HOTPATCH_ACTION_REPLACE_FUNCTION,
+    HOTPATCH_ACTION_SKIP_CALL, HotpatchPidEntry, HotpatchRuleEntry, KernelEvent, RateLimitEntry,
 };
 use log::{info, warn};
 use object::{Object, ObjectSymbol};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{Interest, unix::AsyncFd},
-    net::TcpListener,
+    fs as tokio_fs,
+    io::{AsyncWriteExt, Interest, unix::AsyncFd},
+    net::{TcpListener, UnixListener},
     process::Command,
     signal,
     sync::{RwLock, broadcast},
 };
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::StreamExt as TokioStreamExt;
+use tokio_stream::{StreamExt as TokioStreamExt, wrappers::BroadcastStream};
 use tower_http::cors::CorsLayer;
 
 mod ai;
@@ -97,6 +99,9 @@ struct AiConfig {
     /// API key (empty for Ollama / local models).
     #[serde(default)]
     api_key: String,
+    /// Periodic analysis interval in hours. 0 disables scheduled analysis.
+    #[serde(default)]
+    analysis_interval_hours: u32,
 }
 
 fn default_ai_model() -> String {
@@ -111,6 +116,7 @@ impl Default for AiConfig {
             base_url: String::new(),
             model: default_ai_model(),
             api_key: String::new(),
+            analysis_interval_hours: 0,
         }
     }
 }
@@ -142,6 +148,12 @@ struct Opt {
     web_listen: String,
     #[arg(long, default_value = "gaia-events.db")]
     db_path: String,
+    #[arg(long, default_value = "/tmp/gaia-ai-notify.sock")]
+    notify_socket: PathBuf,
+    #[arg(long, default_value_t = true)]
+    notify_autostart: bool,
+    #[arg(long)]
+    notify_bin: Option<PathBuf>,
 }
 
 // ── Policy config (YAML / TOML) ──
@@ -262,21 +274,48 @@ impl Default for MonitorPolicy {
     fn default() -> Self {
         Self {
             sensitive_prefixes: vec![
-                ToggleItem { value: "/etc/shadow".into(), enabled: true },
-                ToggleItem { value: "/etc/ssl".into(), enabled: true },
-                ToggleItem { value: "/root/.ssh".into(), enabled: true },
+                ToggleItem {
+                    value: "/etc/shadow".into(),
+                    enabled: true,
+                },
+                ToggleItem {
+                    value: "/etc/ssl".into(),
+                    enabled: true,
+                },
+                ToggleItem {
+                    value: "/root/.ssh".into(),
+                    enabled: true,
+                },
             ],
             monitored_services: vec![
-                ToggleItem { value: "sshd.service".into(), enabled: true },
-                ToggleItem { value: "nginx.service".into(), enabled: true },
+                ToggleItem {
+                    value: "sshd.service".into(),
+                    enabled: true,
+                },
+                ToggleItem {
+                    value: "nginx.service".into(),
+                    enabled: true,
+                },
             ],
             exec_whitelist_prefixes: vec![
-                ToggleItem { value: "/usr/bin".into(), enabled: true },
-                ToggleItem { value: "/usr/sbin".into(), enabled: true },
+                ToggleItem {
+                    value: "/usr/bin".into(),
+                    enabled: true,
+                },
+                ToggleItem {
+                    value: "/usr/sbin".into(),
+                    enabled: true,
+                },
             ],
             blocked_ports: vec![
-                TogglePort { port: 4444, enabled: true },
-                TogglePort { port: 31337, enabled: true },
+                TogglePort {
+                    port: 4444,
+                    enabled: true,
+                },
+                TogglePort {
+                    port: 31337,
+                    enabled: true,
+                },
             ],
             baseline_thresholds: HashMap::from([
                 ("file_io".to_string(), 50),
@@ -449,7 +488,10 @@ impl KtimeAnchor {
             .unwrap_or_default()
             .as_millis() as u64;
         let ktime_ns = (uptime_secs * 1_000_000_000.0) as u64;
-        Self { unix_epoch_ms, ktime_ns }
+        Self {
+            unix_epoch_ms,
+            ktime_ns,
+        }
     }
 
     /// Convert a bpf_ktime_get_ns() timestamp to Unix epoch milliseconds.
@@ -473,6 +515,8 @@ struct Shared {
     ai_config: Arc<RwLock<AiConfig>>,
     /// Broadcast channel for pushing high-severity alert notifications to AI event stream.
     ai_alert_tx: broadcast::Sender<AiAlertNotification>,
+    /// Unix socket used to send control commands to the gaia-notify sidecar.
+    notify_control_socket: PathBuf,
     /// Anchor for ktime → Unix epoch conversion.
     ktime_anchor: KtimeAnchor,
     /// SQLite event history database.
@@ -531,11 +575,12 @@ async fn main() -> Result<()> {
         code_patches: Arc::new(Mutex::new(Vec::new())),
         ai_config: Arc::new(RwLock::new(ai_config)),
         ai_alert_tx,
+        notify_control_socket: control_socket_path(&opt.notify_socket),
         ktime_anchor,
         db: Arc::new(event_db),
-        livepatch_mgr: Arc::new(tokio::sync::Mutex::new(
-            livepatch::LivepatchManager::new(livepatch_build_dir),
-        )),
+        livepatch_mgr: Arc::new(tokio::sync::Mutex::new(livepatch::LivepatchManager::new(
+            livepatch_build_dir,
+        ))),
     };
 
     // The kprobe guard was already attached in attach_agents(), so the
@@ -580,6 +625,8 @@ async fn main() -> Result<()> {
 
     spawn_service_tracker(shared.clone());
     spawn_traffic_sampler(shared.clone());
+    spawn_notify_socket_server(shared.ai_alert_tx.clone(), opt.notify_socket.clone());
+    let mut notify_child = spawn_notify_sidecar(&opt).await;
 
     let web_state = shared.clone();
     let web_listen = opt.web_listen.clone();
@@ -602,6 +649,21 @@ async fn main() -> Result<()> {
     signal::ctrl_c().await.context("waiting for ctrl-c")?;
     info!("gaia controller exiting");
 
+    if let Err(err) = fs::remove_file(&opt.notify_socket) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                "failed to remove notify socket {}: {err:#}",
+                opt.notify_socket.display()
+            );
+        }
+    }
+
+    if let Some(child) = notify_child.as_mut() {
+        if let Err(err) = child.kill().await {
+            warn!("failed to stop gaia-notify sidecar: {err:#}");
+        }
+    }
+
     // Clean up kernel livepatches on exit.
     {
         let mut mgr = shared.livepatch_mgr.lock().await;
@@ -612,10 +674,7 @@ async fn main() -> Result<()> {
 }
 
 /// Apply all enabled kernel livepatch targets from the policy.
-async fn apply_kernel_livepatches(
-    shared: &Shared,
-    targets: &[livepatch::KernelLivepatchTarget],
-) {
+async fn apply_kernel_livepatches(shared: &Shared, targets: &[livepatch::KernelLivepatchTarget]) {
     let enabled: Vec<_> = targets.iter().filter(|t| t.enabled).cloned().collect();
     if enabled.is_empty() {
         return;
@@ -631,9 +690,70 @@ async fn apply_kernel_livepatches(
 
     let mut mgr = shared.livepatch_mgr.lock().await;
     match mgr.apply(&enabled).await {
-        Ok(name) => info!("kernel livepatch: module {name} applied ({} func(s))", enabled.len()),
+        Ok(name) => info!(
+            "kernel livepatch: module {name} applied ({} func(s))",
+            enabled.len()
+        ),
         Err(e) => warn!("kernel livepatch: failed to apply: {e:#}"),
     }
+}
+
+async fn spawn_notify_sidecar(opt: &Opt) -> Option<tokio::process::Child> {
+    if !opt.notify_autostart {
+        info!("gaia-notify autostart disabled");
+        return None;
+    }
+
+    let bin_path = opt
+        .notify_bin
+        .clone()
+        .or_else(resolve_notify_binary)
+        .unwrap_or_else(|| PathBuf::from("gaia-notify"));
+
+    let mut cmd = Command::new(&bin_path);
+    cmd.arg("--config")
+        .arg(&opt.config)
+        .arg("--socket-path")
+        .arg(&opt.notify_socket)
+        .arg("--control-socket-path")
+        .arg(control_socket_path(&opt.notify_socket))
+        .kill_on_drop(true);
+
+    match cmd.spawn() {
+        Ok(child) => {
+            info!(
+                "started gaia-notify sidecar: bin={} socket={}",
+                bin_path.display(),
+                opt.notify_socket.display()
+            );
+            Some(child)
+        }
+        Err(err) => {
+            warn!(
+                "failed to start gaia-notify sidecar from {}: {err:#}",
+                bin_path.display()
+            );
+            None
+        }
+    }
+}
+
+fn resolve_notify_binary() -> Option<PathBuf> {
+    let current = std::env::current_exe().ok()?;
+    let sibling = current.with_file_name("gaia-notify");
+    if sibling.exists() {
+        return Some(sibling);
+    }
+    None
+}
+
+fn control_socket_path(notify_socket: &Path) -> PathBuf {
+    let parent = notify_socket.parent().unwrap_or(Path::new("."));
+    let stem = notify_socket
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("gaia-ai-notify");
+    parent.join(format!("{stem}-control.sock"))
 }
 
 // ── eBPF attach ──
@@ -680,7 +800,10 @@ fn attach_agents(bpf: &mut Ebpf) -> Result<()> {
     prog.load().context("load cgroup_connect4")?;
     prog.attach(&cgroup_fd, CgroupAttachMode::Single)
         .context("attach cgroup_connect4")?;
-    info!("port blocking agent attached: cgroup/connect4 on {}", cgroup_path.display());
+    info!(
+        "port blocking agent attached: cgroup/connect4 on {}",
+        cgroup_path.display()
+    );
 
     let prog: &mut CgroupSockAddr = bpf
         .program_mut("cgroup_bind4")
@@ -690,7 +813,10 @@ fn attach_agents(bpf: &mut Ebpf) -> Result<()> {
     prog.load().context("load cgroup_bind4")?;
     prog.attach(&cgroup_fd, CgroupAttachMode::Single)
         .context("attach cgroup_bind4")?;
-    info!("port blocking agent attached: cgroup/bind4 on {}", cgroup_path.display());
+    info!(
+        "port blocking agent attached: cgroup/bind4 on {}",
+        cgroup_path.display()
+    );
 
     let prog: &mut CgroupSockAddr = bpf
         .program_mut("cgroup_connect6")
@@ -700,7 +826,10 @@ fn attach_agents(bpf: &mut Ebpf) -> Result<()> {
     prog.load().context("load cgroup_connect6")?;
     prog.attach(&cgroup_fd, CgroupAttachMode::Single)
         .context("attach cgroup_connect6")?;
-    info!("port blocking agent attached: cgroup/connect6 on {}", cgroup_path.display());
+    info!(
+        "port blocking agent attached: cgroup/connect6 on {}",
+        cgroup_path.display()
+    );
 
     let prog: &mut CgroupSockAddr = bpf
         .program_mut("cgroup_bind6")
@@ -710,7 +839,10 @@ fn attach_agents(bpf: &mut Ebpf) -> Result<()> {
     prog.load().context("load cgroup_bind6")?;
     prog.attach(&cgroup_fd, CgroupAttachMode::Single)
         .context("attach cgroup_bind6")?;
-    info!("port blocking agent attached: cgroup/bind6 on {}", cgroup_path.display());
+    info!(
+        "port blocking agent attached: cgroup/bind6 on {}",
+        cgroup_path.display()
+    );
 
     Ok(())
 }
@@ -778,13 +910,21 @@ fn apply_blocked_ports(bpf: &mut Ebpf, blocked_ports: &[TogglePort]) -> Result<(
         let _ = ports.remove(&k);
     }
     // Only insert enabled ports
-    let active: Vec<u16> = blocked_ports.iter().filter(|p| p.enabled).map(|p| p.port).collect();
+    let active: Vec<u16> = blocked_ports
+        .iter()
+        .filter(|p| p.enabled)
+        .map(|p| p.port)
+        .collect();
     for port in &active {
         ports
             .insert(*port, 1, 0)
             .with_context(|| format!("insert blocked port {port}"))?;
     }
-    info!("blocked ports configured: {active:?} ({} enabled / {} total)", active.len(), blocked_ports.len());
+    info!(
+        "blocked ports configured: {active:?} ({} enabled / {} total)",
+        active.len(),
+        blocked_ports.len()
+    );
     Ok(())
 }
 
@@ -913,7 +1053,11 @@ fn sync_bpf_hotpatch_pids(shared: &Shared, targets: &[HotpatchTarget]) {
             }
         }
         let enabled = targets.iter().filter(|t| t.enabled).count();
-        info!("hotpatch PID filter updated: {} enabled / {} total", enabled, targets.len());
+        info!(
+            "hotpatch PID filter updated: {} enabled / {} total",
+            enabled,
+            targets.len()
+        );
     }
 }
 
@@ -951,14 +1095,13 @@ fn sync_bpf_hotpatch_rules(shared: &Shared, targets: &[HotpatchTarget]) {
                     return;
                 }
             };
-            let mut rule_map =
-                match BpfHashMap::<_, u32, HotpatchRuleEntry>::try_from(map) {
-                    Ok(m) => m,
-                    Err(err) => {
-                        warn!("HOTPATCH_RULES cast failed: {err:#}");
-                        return;
-                    }
-                };
+            let mut rule_map = match BpfHashMap::<_, u32, HotpatchRuleEntry>::try_from(map) {
+                Ok(m) => m,
+                Err(err) => {
+                    warn!("HOTPATCH_RULES cast failed: {err:#}");
+                    return;
+                }
+            };
             // Clear existing
             let existing: Vec<u32> = rule_map.keys().filter_map(|k| k.ok()).collect();
             for k in existing {
@@ -1130,10 +1273,7 @@ struct PatchedFunction {
 /// A PID must be explicitly specified in the target configuration. Targets without
 /// a PID are skipped with a warning (hotpatching is only supported for long-running
 /// processes like databases or systemd services).
-fn apply_hotpatch_code_patches(
-    targets: &[HotpatchTarget],
-    patches: &mut Vec<PatchedFunction>,
-) {
+fn apply_hotpatch_code_patches(targets: &[HotpatchTarget], patches: &mut Vec<PatchedFunction>) {
     for target in targets {
         if !target.enabled {
             continue;
@@ -1152,7 +1292,10 @@ fn apply_hotpatch_code_patches(
 
         let binary_path = Path::new(&target.binary);
         if !binary_path.exists() {
-            warn!("hotpatch binary not found: {} — skipping patch", target.binary);
+            warn!(
+                "hotpatch binary not found: {} — skipping patch",
+                target.binary
+            );
             continue;
         }
 
@@ -1186,7 +1329,10 @@ fn apply_single_code_patch(
     };
 
     // Check if already patched at this address
-    if patches.iter().any(|p| p.pid == pid && p.address == func_addr) {
+    if patches
+        .iter()
+        .any(|p| p.pid == pid && p.address == func_addr)
+    {
         info!(
             "hotpatch already applied at {}:{} pid={} addr=0x{:x}",
             target.binary, target.symbol, pid, func_addr
@@ -1309,8 +1455,7 @@ fn inject_shared_library(pid: u32, lib_path: &Path) -> Result<()> {
     let lib_path_bytes = lib_path_str.as_bytes();
 
     // Check if already loaded
-    let maps = fs::read_to_string(format!("/proc/{pid}/maps"))
-        .context("read /proc/pid/maps")?;
+    let maps = fs::read_to_string(format!("/proc/{pid}/maps")).context("read /proc/pid/maps")?;
     if maps.contains(&lib_path_str) {
         info!("library {} already loaded in pid={}", lib_path_str, pid);
         return Ok(());
@@ -1374,9 +1519,7 @@ fn inject_shared_library(pid: u32, lib_path: &Path) -> Result<()> {
     // Write path string via POKETEXT
     let word_size = std::mem::size_of::<libc::c_long>();
     for i in (0..aligned_len).step_by(word_size) {
-        let word = libc::c_long::from_ne_bytes(
-            path_buf[i..i + word_size].try_into().unwrap(),
-        );
+        let word = libc::c_long::from_ne_bytes(path_buf[i..i + word_size].try_into().unwrap());
         let ret = unsafe {
             libc::ptrace(
                 libc::PTRACE_POKETEXT,
@@ -1404,11 +1547,11 @@ fn inject_shared_library(pid: u32, lib_path: &Path) -> Result<()> {
     // from the stack.
     let new_sp = string_addr & !0xF; // 16-byte aligned, below the string
     let mut call_regs = orig_regs;
-    call_regs[0] = string_addr;       // x0 = path to .so
-    call_regs[1] = 0x2;               // x1 = RTLD_NOW
-    call_regs[30] = 0;                // LR = 0 (will SIGSEGV on return)
-    call_regs[31] = new_sp;           // SP (16-byte aligned)
-    call_regs[32] = dlopen_addr;      // PC = __libc_dlopen_mode
+    call_regs[0] = string_addr; // x0 = path to .so
+    call_regs[1] = 0x2; // x1 = RTLD_NOW
+    call_regs[30] = 0; // LR = 0 (will SIGSEGV on return)
+    call_regs[31] = new_sp; // SP (16-byte aligned)
+    call_regs[32] = dlopen_addr; // PC = __libc_dlopen_mode
 
     iov.iov_len = std::mem::size_of_val(&call_regs);
     iov.iov_base = call_regs.as_mut_ptr() as *mut libc::c_void;
@@ -1536,8 +1679,7 @@ fn inject_shared_library(pid: u32, lib_path: &Path) -> Result<()> {
     let lib_path_bytes = lib_path_str.as_bytes();
 
     // Check if already loaded
-    let maps = fs::read_to_string(format!("/proc/{pid}/maps"))
-        .context("read /proc/pid/maps")?;
+    let maps = fs::read_to_string(format!("/proc/{pid}/maps")).context("read /proc/pid/maps")?;
     if maps.contains(&lib_path_str) {
         info!("library {} already loaded in pid={}", lib_path_str, pid);
         return Ok(());
@@ -1595,9 +1737,7 @@ fn inject_shared_library(pid: u32, lib_path: &Path) -> Result<()> {
     // Write path string via POKETEXT
     let word_size = std::mem::size_of::<libc::c_long>();
     for i in (0..aligned_len).step_by(word_size) {
-        let word = libc::c_long::from_ne_bytes(
-            path_buf[i..i + word_size].try_into().unwrap(),
-        );
+        let word = libc::c_long::from_ne_bytes(path_buf[i..i + word_size].try_into().unwrap());
         let ret = unsafe {
             libc::ptrace(
                 libc::PTRACE_POKETEXT,
@@ -1646,10 +1786,10 @@ fn inject_shared_library(pid: u32, lib_path: &Path) -> Result<()> {
     }
 
     let mut call_regs = orig_regs;
-    call_regs.rdi = string_addr;       // 1st arg: path to .so
-    call_regs.rsi = 0x2;               // 2nd arg: RTLD_NOW
-    call_regs.rsp = fake_ret_rsp;      // RSP points to the fake return address
-    call_regs.rip = dlopen_addr;       // RIP = __libc_dlopen_mode
+    call_regs.rdi = string_addr; // 1st arg: path to .so
+    call_regs.rsi = 0x2; // 2nd arg: RTLD_NOW
+    call_regs.rsp = fake_ret_rsp; // RSP points to the fake return address
+    call_regs.rip = dlopen_addr; // RIP = __libc_dlopen_mode
     // CRITICAL: Set orig_rax to -1 to prevent the kernel from restarting a
     // syscall that was interrupted by our PTRACE_ATTACH. Without this, the
     // kernel may subtract 2 from RIP on PTRACE_CONT (to re-execute the
@@ -1768,8 +1908,7 @@ fn inject_shared_library(pid: u32, lib_path: &Path) -> Result<()> {
 /// On newer glibc (2.35+), the first mapping is r--p (read-only data) at offset 0,
 /// followed by r-xp at a non-zero offset, so using r-xp would produce a wrong address.
 fn resolve_libc_dlopen_in_target(pid: u32) -> Result<u64> {
-    let maps = fs::read_to_string(format!("/proc/{pid}/maps"))
-        .context("read /proc/pid/maps")?;
+    let maps = fs::read_to_string(format!("/proc/{pid}/maps")).context("read /proc/pid/maps")?;
 
     // Find the first mapping of libc (file offset 0 = load base).
     // Fall back to the first r-xp mapping if no offset-0 mapping is found.
@@ -1846,8 +1985,7 @@ fn resolve_injected_symbol(pid: u32, lib_path: &Path, symbol: &str) -> Result<u6
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let maps = fs::read_to_string(format!("/proc/{pid}/maps"))
-        .context("read /proc/pid/maps")?;
+    let maps = fs::read_to_string(format!("/proc/{pid}/maps")).context("read /proc/pid/maps")?;
 
     // Strategy: prefer the mapping with file offset 0 (true load base).
     // Fall back to the first mapping (any permission) if no offset-0 mapping is found.
@@ -1883,25 +2021,23 @@ fn resolve_injected_symbol(pid: u32, lib_path: &Path, symbol: &str) -> Result<u6
         }
     }
 
-    let base = offset0_base
-        .or(first_base)
-        .ok_or_else(|| {
-            // Dump maps lines containing the filename for debugging
-            let relevant: Vec<&str> = maps
-                .lines()
-                .filter(|l| {
-                    l.contains(canonical_str.as_ref())
-                        || (!filename.is_empty() && l.contains(&filename))
-                })
-                .collect();
-            anyhow!(
-                "injected library {} (filename={}) not found in pid={} maps. Relevant lines: {:?}",
-                canonical_str,
-                filename,
-                pid,
-                relevant
-            )
-        })?;
+    let base = offset0_base.or(first_base).ok_or_else(|| {
+        // Dump maps lines containing the filename for debugging
+        let relevant: Vec<&str> = maps
+            .lines()
+            .filter(|l| {
+                l.contains(canonical_str.as_ref())
+                    || (!filename.is_empty() && l.contains(&filename))
+            })
+            .collect();
+        anyhow!(
+            "injected library {} (filename={}) not found in pid={} maps. Relevant lines: {:?}",
+            canonical_str,
+            filename,
+            pid,
+            relevant
+        )
+    })?;
 
     info!(
         "resolve_injected_symbol: found {} at base=0x{:x} in pid={} maps",
@@ -1933,10 +2069,7 @@ fn apply_replace_function_patch(
 
     let lib_path = Path::new(&replace_lib);
     if !lib_path.exists() {
-        warn!(
-            "replacement library not found: {} — skipping",
-            replace_lib
-        );
+        warn!("replacement library not found: {} — skipping", replace_lib);
         return;
     }
 
@@ -1953,7 +2086,10 @@ fn apply_replace_function_patch(
     };
 
     // Check if already patched
-    if patches.iter().any(|p| p.pid == pid && p.address == func_addr) {
+    if patches
+        .iter()
+        .any(|p| p.pid == pid && p.address == func_addr)
+    {
         info!(
             "replace_function already applied at {}:{} pid={} addr=0x{:x}",
             target.binary, target.symbol, pid, func_addr
@@ -1963,10 +2099,7 @@ fn apply_replace_function_patch(
 
     // Step 1: Inject the .so into the target process
     if let Err(err) = inject_shared_library(pid, lib_path) {
-        warn!(
-            "failed to inject {} into pid={}: {err:#}",
-            replace_lib, pid
-        );
+        warn!("failed to inject {} into pid={}: {err:#}", replace_lib, pid);
         return;
     }
 
@@ -1974,10 +2107,7 @@ fn apply_replace_function_patch(
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     // Step 2: Resolve the replacement function's address in the target
-    let replace_sym = target
-        .replace_symbol
-        .as_deref()
-        .unwrap_or(&target.symbol);
+    let replace_sym = target.replace_symbol.as_deref().unwrap_or(&target.symbol);
     let new_func_addr = match resolve_injected_symbol(pid, lib_path, replace_sym) {
         Ok(addr) => addr,
         Err(err) => {
@@ -2085,9 +2215,8 @@ fn ptrace_read_and_write(pid: u32, addr: u64, new_data: &[u8]) -> Result<Vec<u8>
     for i in 0..num_words {
         let offset = (i * word_size) as u64;
         let start = i * word_size;
-        let new_word = libc::c_long::from_ne_bytes(
-            new_data[start..start + word_size].try_into().unwrap(),
-        );
+        let new_word =
+            libc::c_long::from_ne_bytes(new_data[start..start + word_size].try_into().unwrap());
         let ret = unsafe {
             libc::ptrace(
                 libc::PTRACE_POKETEXT,
@@ -2296,9 +2425,7 @@ fn write_process_memory(pid: u32, addr: u64, data: &[u8]) -> Result<()> {
             let remaining = data.len() - offset;
             let word: libc::c_long = if remaining >= word_size {
                 // Full word write
-                libc::c_long::from_ne_bytes(
-                    data[offset..offset + word_size].try_into().unwrap(),
-                )
+                libc::c_long::from_ne_bytes(data[offset..offset + word_size].try_into().unwrap())
             } else {
                 // Partial word: read existing word first, then overlay our bytes
                 unsafe { *libc::__errno_location() = 0 };
@@ -2379,6 +2506,73 @@ fn spawn_event_collector(events: RingBuf<MapData>, shared: Shared) {
     });
 }
 
+fn spawn_notify_socket_server(
+    ai_alert_tx: broadcast::Sender<AiAlertNotification>,
+    socket_path: PathBuf,
+) {
+    tokio::spawn(async move {
+        if let Some(parent) = socket_path.parent() {
+            if let Err(err) = tokio_fs::create_dir_all(parent).await {
+                warn!(
+                    "failed to create notify socket directory {}: {err:#}",
+                    parent.display()
+                );
+                return;
+            }
+        }
+
+        if let Err(err) = tokio_fs::remove_file(&socket_path).await {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    "failed to remove stale notify socket {}: {err:#}",
+                    socket_path.display()
+                );
+                return;
+            }
+        }
+
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(listener) => listener,
+            Err(err) => {
+                warn!(
+                    "failed to bind notify socket {}: {err:#}",
+                    socket_path.display()
+                );
+                return;
+            }
+        };
+        info!("AI notify socket listening on {}", socket_path.display());
+
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(err) => {
+                    warn!("notify socket accept failed: {err:#}");
+                    continue;
+                }
+            };
+            let mut rx = ai_alert_tx.subscribe();
+
+            tokio::spawn(async move {
+                while let Ok(notification) = rx.recv().await {
+                    let mut payload = match serde_json::to_vec(&notification) {
+                        Ok(bytes) => bytes,
+                        Err(err) => {
+                            warn!("serialize notify payload failed: {err:#}");
+                            continue;
+                        }
+                    };
+                    payload.push(b'\n');
+                    if let Err(err) = stream.write_all(&payload).await {
+                        warn!("notify socket client disconnected: {err:#}");
+                        break;
+                    }
+                }
+            });
+        }
+    });
+}
+
 // ── Systemd service tracker ──
 
 fn spawn_service_tracker(shared: Shared) {
@@ -2409,7 +2603,9 @@ fn spawn_service_tracker(shared: Shared) {
                     if let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) {
                         let comm = comm.trim().to_string();
                         if !comm.is_empty() {
-                            comm_map.entry(comm).or_insert_with(|| service.value.clone());
+                            comm_map
+                                .entry(comm)
+                                .or_insert_with(|| service.value.clone());
                         }
                     }
                 }
@@ -2418,12 +2614,15 @@ fn spawn_service_tracker(shared: Shared) {
                 } else {
                     format!("{active_state} ({sub_state})")
                 };
-                mapping.insert(service.value.clone(), ServiceStatus {
-                    active_state,
-                    sub_state,
-                    state,
-                    pids,
-                });
+                mapping.insert(
+                    service.value.clone(),
+                    ServiceStatus {
+                        active_state,
+                        sub_state,
+                        state,
+                        pids,
+                    },
+                );
             }
             let mut state = shared.runtime.write().await;
             state.service_map = mapping;
@@ -2673,7 +2872,9 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
     // suppress further alerts for that kind for BASELINE_ALERT_COOLDOWN_SECS.
     if let Some(&threshold) = policy.baseline_thresholds.get(&key) {
         let now = Instant::now();
-        let (window_start, count) = state.baseline.windows
+        let (window_start, count) = state
+            .baseline
+            .windows
             .entry(key.clone())
             .or_insert((now, 0));
 
@@ -2688,7 +2889,10 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
 
         if rate > threshold {
             // Only alert if outside the cooldown period for this kind
-            let in_cooldown = state.baseline.last_alert.get(&key)
+            let in_cooldown = state
+                .baseline
+                .last_alert
+                .get(&key)
                 .map(|t| t.elapsed() < Duration::from_secs(BASELINE_ALERT_COOLDOWN_SECS))
                 .unwrap_or(false);
 
@@ -2699,7 +2903,9 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
                     "medium",
                     format!("syscall rate exceeded for {key}: {rate}/s > {threshold}/s"),
                     &record,
-                ) { ai_notifications.push(n); }
+                ) {
+                    ai_notifications.push(n);
+                }
             }
         }
     }
@@ -2714,7 +2920,9 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
             "high",
             "sensitive file accessed".into(),
             &record,
-        ) { ai_notifications.push(n); }
+        ) {
+            ai_notifications.push(n);
+        }
     }
 
     // Whitelist rule: execve path check
@@ -2724,7 +2932,9 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
             "high",
             "execve target not in whitelist prefixes".into(),
             &record,
-        ) { ai_notifications.push(n); }
+        ) {
+            ai_notifications.push(n);
+        }
     }
 
     // Privilege escalation alert
@@ -2734,7 +2944,9 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
             "high",
             "privilege change detected".into(),
             &record,
-        ) { ai_notifications.push(n); }
+        ) {
+            ai_notifications.push(n);
+        }
     }
 
     // Active defense: blocked port
@@ -2742,7 +2954,11 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
         info!(
             "BLOCKED port {} ({}) by {} (pid={}, detail={})",
             record.network.as_ref().map(|n| n.port).unwrap_or(0),
-            record.network.as_ref().map(|n| n.address.as_str()).unwrap_or("?"),
+            record
+                .network
+                .as_ref()
+                .map(|n| n.address.as_str())
+                .unwrap_or("?"),
             record.comm,
             record.pid,
             record.detail,
@@ -2756,7 +2972,9 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
                 record.detail,
             ),
             &record,
-        ) { ai_notifications.push(n); }
+        ) {
+            ai_notifications.push(n);
+        }
     }
 
     // Rate limit exceeded
@@ -2766,7 +2984,9 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
             "high",
             format!("IP rate limit exceeded — {}", record.detail),
             &record,
-        ) { ai_notifications.push(n); }
+        ) {
+            ai_notifications.push(n);
+        }
     }
 
     // ── Service-specific alerts: flag notable activity from monitored services ──
@@ -2776,9 +2996,14 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
             if let Some(n) = push_alert(
                 &mut state,
                 "high",
-                format!("monitored service [{svc}] accessed sensitive file: {}", record.detail),
+                format!(
+                    "monitored service [{svc}] accessed sensitive file: {}",
+                    record.detail
+                ),
                 &record,
-            ) { ai_notifications.push(n); }
+            ) {
+                ai_notifications.push(n);
+            }
         }
         // Alert on network activity from a monitored service
         if event.kind == EVENT_KIND_NETWORK {
@@ -2792,16 +3017,23 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
                 "medium",
                 format!("monitored service [{svc}] network activity: {addr_info}"),
                 &record,
-            ) { ai_notifications.push(n); }
+            ) {
+                ai_notifications.push(n);
+            }
         }
         // Alert on privilege changes within a monitored service
         if event.kind == EVENT_KIND_PRIVILEGE {
             if let Some(n) = push_alert(
                 &mut state,
                 "critical",
-                format!("monitored service [{svc}] privilege change: {}", record.detail),
+                format!(
+                    "monitored service [{svc}] privilege change: {}",
+                    record.detail
+                ),
                 &record,
-            ) { ai_notifications.push(n); }
+            ) {
+                ai_notifications.push(n);
+            }
         }
         // Alert on process execution from a monitored service
         if event.kind == EVENT_KIND_PROCESS {
@@ -2810,7 +3042,9 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
                 "medium",
                 format!("monitored service [{svc}] exec: {}", record.detail),
                 &record,
-            ) { ai_notifications.push(n); }
+            ) {
+                ai_notifications.push(n);
+            }
         }
     }
 
@@ -2830,7 +3064,9 @@ async fn process_event(event: KernelEvent, shared: &Shared) {
 }
 
 fn exec_path_whitelisted(path: &str, policy: &MonitorPolicy) -> bool {
-    let enabled: Vec<&str> = policy.exec_whitelist_prefixes.iter()
+    let enabled: Vec<&str> = policy
+        .exec_whitelist_prefixes
+        .iter()
         .filter(|p| p.enabled)
         .map(|p| p.value.as_str())
         .collect();
@@ -2841,7 +3077,9 @@ fn exec_path_whitelisted(path: &str, policy: &MonitorPolicy) -> bool {
 }
 
 fn file_path_sensitive(path: &str, policy: &MonitorPolicy) -> bool {
-    let enabled: Vec<&str> = policy.sensitive_prefixes.iter()
+    let enabled: Vec<&str> = policy
+        .sensitive_prefixes
+        .iter()
         .filter(|p| p.enabled)
         .map(|p| p.value.as_str())
         .collect();
@@ -3015,17 +3253,14 @@ fn resolve_symbol_offset(binary: &Path, symbol: &str) -> Result<u64> {
             }
         }
     }
-    let addr = sym_addr.ok_or_else(|| anyhow!("symbol {symbol} not found in {}", binary.display()))?;
+    let addr =
+        sym_addr.ok_or_else(|| anyhow!("symbol {symbol} not found in {}", binary.display()))?;
 
     // For non-PIE executables (ET_EXEC), symbol addresses are absolute virtual addresses.
     // We need to subtract the load base (lowest LOAD segment vaddr) so that
     // resolve_runtime_symbol can correctly compute: maps_base + offset.
     // For shared libraries / PIE (ET_DYN), the lowest vaddr is typically 0 so this is a no-op.
-    let load_vaddr = obj
-        .segments()
-        .map(|seg| seg.address())
-        .min()
-        .unwrap_or(0);
+    let load_vaddr = obj.segments().map(|seg| seg.address()).min().unwrap_or(0);
 
     Ok(addr - load_vaddr)
 }

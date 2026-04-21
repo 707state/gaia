@@ -126,12 +126,18 @@ fn read_process_detail(pid: u32) -> Option<ProcessDetail> {
     let threads: u32 = status_val(&status, "Threads:").parse().unwrap_or(0);
 
     let uid_line = status_val(&status, "Uid:");
-    let uid_parts: Vec<u32> = uid_line.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+    let uid_parts: Vec<u32> = uid_line
+        .split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .collect();
     let uid = uid_parts.first().copied().unwrap_or(0);
     let euid = uid_parts.get(1).copied().unwrap_or(0);
 
     let gid_line = status_val(&status, "Gid:");
-    let gid_parts: Vec<u32> = gid_line.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+    let gid_parts: Vec<u32> = gid_line
+        .split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .collect();
     let gid = gid_parts.first().copied().unwrap_or(0);
     let egid = gid_parts.get(1).copied().unwrap_or(0);
 

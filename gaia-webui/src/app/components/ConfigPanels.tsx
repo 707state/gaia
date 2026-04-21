@@ -10,36 +10,57 @@ import type {
   PatchAction,
   RateLimitRule,
   TranslateFn,
+  WechatBotStatus,
 } from '../types'
 import { mapKind } from '../utils'
 
 export function AiConfigPanel({ tr, flash }: { tr: TranslateFn; flash: (msg: string) => void }) {
   const [cfg, setCfg] = useState<AiConfig | null>(null)
+  const [draft, setDraft] = useState<AiConfig | null>(null)
+  const [wechatStatus, setWechatStatus] = useState<WechatBotStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [triggering, setTriggering] = useState(false)
 
   useEffect(() => {
-    fetch('/api/v1/ai/config')
-      .then(r => r.ok ? r.json() : null)
-      .then((c: AiConfig | null) => { if (c) setCfg(c) })
+    Promise.all([
+      fetch('/api/v1/ai/config').then(r => r.ok ? r.json() : null),
+      fetch('/api/v1/ai/wechat/status').then(r => r.ok ? r.json() : null).catch(() => null),
+    ])
+      .then(([c, ws]: [AiConfig | null, WechatBotStatus | null]) => {
+        if (c) {
+          setCfg(c)
+          setDraft(c)
+        }
+        if (ws) setWechatStatus(ws)
+      })
       .catch(() => {})
       .finally(() => setLoading(false))
   }, [])
 
-  const save = async (updates: Partial<AiConfig>) => {
-    if (!cfg) return
-    const next = { ...cfg, ...updates }
-    setCfg(next)
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      fetch('/api/v1/ai/wechat/status')
+        .then(r => r.ok ? r.json() : null)
+        .then((ws: WechatBotStatus | null) => { if (ws) setWechatStatus(ws) })
+        .catch(() => {})
+    }, 3000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  const save = async () => {
+    if (!draft) return
     setSaving(true)
     try {
       const r = await fetch('/api/v1/ai/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(updates),
+        body: JSON.stringify(draft),
       })
       if (r.ok) {
         const updated = await r.json() as AiConfig
         setCfg(updated)
+        setDraft(updated)
         flash(tr('AI 配置已保存', 'AI config saved'))
       } else {
         flash(tr('保存失败', 'Save failed'))
@@ -50,7 +71,28 @@ export function AiConfigPanel({ tr, flash }: { tr: TranslateFn; flash: (msg: str
     setSaving(false)
   }
 
-  if (loading || !cfg) return null
+  const triggerAnalysis = async () => {
+    setTriggering(true)
+    try {
+      const r = await fetch('/api/v1/ai/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source: 'webui_manual' }),
+      })
+      if (r.ok) {
+        flash(tr('已触发分析，结果将通过微信推送。', 'Analysis triggered. Results will be sent via WeChat.'))
+      } else {
+        flash(tr('触发分析失败', 'Failed to trigger analysis'))
+      }
+    } catch {
+      flash(tr('触发分析失败: 网络错误', 'Failed to trigger analysis: network error'))
+    }
+    setTriggering(false)
+  }
+
+  if (loading || !cfg || !draft) return null
+
+  const isDirty = JSON.stringify(cfg) !== JSON.stringify(draft)
 
   const providerLabels: Record<AiProvider, string> = {
     open_ai: 'OpenAI / Compatible',
@@ -64,14 +106,14 @@ export function AiConfigPanel({ tr, flash }: { tr: TranslateFn; flash: (msg: str
         <h3>🤖 {tr('AI 分析系统', 'AI Analysis System')}</h3>
         <div className="header-actions">
           <button
-            className={`switch ${cfg.enabled ? 'on' : 'off'}`}
-            onClick={() => save({ enabled: !cfg.enabled })}
-            title={cfg.enabled ? tr('点击关闭 AI 分析', 'Click to disable AI') : tr('点击启用 AI 分析', 'Click to enable AI')}
+            className={`switch ${draft.enabled ? 'on' : 'off'}`}
+            onClick={() => setDraft({ ...draft, enabled: !draft.enabled })}
+            title={draft.enabled ? tr('点击关闭 AI 分析', 'Click to disable AI') : tr('点击启用 AI 分析', 'Click to enable AI')}
           >
             <span className="switch-knob" />
           </button>
-          <span className={`card-badge ${cfg.enabled ? '' : 'danger'}`}>
-            {cfg.enabled ? tr('已启用', 'Enabled') : tr('已禁用', 'Disabled')}
+          <span className={`card-badge ${draft.enabled ? '' : 'danger'}`}>
+            {draft.enabled ? tr('已启用', 'Enabled') : tr('已禁用', 'Disabled')}
           </span>
         </div>
       </div>
@@ -80,11 +122,11 @@ export function AiConfigPanel({ tr, flash }: { tr: TranslateFn; flash: (msg: str
         'Integrate an LLM for security event analysis. When enabled, interact with AI in the "AI Analysis" tab. High-severity alerts are automatically pushed to the AI chat panel.'
       )}</p>
 
-      {cfg.enabled && (
+      {draft.enabled && (
         <div className="ai-config-form">
           <div className="config-row">
             <label>{tr('LLM 提供商', 'LLM Provider')}</label>
-            <select value={cfg.provider} onChange={e => save({ provider: e.target.value as AiProvider })} disabled={saving}>
+            <select value={draft.provider} onChange={e => setDraft({ ...draft, provider: e.target.value as AiProvider })} disabled={saving}>
               {(Object.keys(providerLabels) as AiProvider[]).map(p => (
                 <option key={p} value={p}>{providerLabels[p]}</option>
               ))}
@@ -95,45 +137,134 @@ export function AiConfigPanel({ tr, flash }: { tr: TranslateFn; flash: (msg: str
             <label>{tr('模型名称', 'Model Name')}</label>
             <input
               type="text"
-              value={cfg.model}
-              placeholder={cfg.provider === 'ollama' ? 'llama3.2' : 'gpt-4o-mini'}
-              onChange={e => setCfg({ ...cfg, model: e.target.value })}
-              onBlur={e => save({ model: e.target.value })}
+              value={draft.model}
+              placeholder={draft.provider === 'ollama' ? 'llama3.2' : 'gpt-4o-mini'}
+              onChange={e => setDraft({ ...draft, model: e.target.value })}
               disabled={saving}
             />
           </div>
 
           <div className="config-row">
-            <label>{cfg.provider === 'ollama' ? tr('Ollama 地址', 'Ollama Base URL') : tr('API Base URL', 'API Base URL')}</label>
+            <label>{draft.provider === 'ollama' ? tr('Ollama 地址', 'Ollama Base URL') : tr('API Base URL', 'API Base URL')}</label>
             <input
               type="text"
-              value={cfg.base_url}
-              placeholder={cfg.provider === 'ollama' ? 'http://localhost:11434' : 'https://api.openai.com'}
-              onChange={e => setCfg({ ...cfg, base_url: e.target.value })}
-              onBlur={e => save({ base_url: e.target.value })}
+              value={draft.base_url}
+              placeholder={draft.provider === 'ollama' ? 'http://localhost:11434' : 'https://api.openai.com'}
+              onChange={e => setDraft({ ...draft, base_url: e.target.value })}
               disabled={saving}
             />
           </div>
 
-          {cfg.provider !== 'ollama' && (
+          {draft.provider !== 'ollama' && (
             <div className="config-row">
               <label>{tr('API Key', 'API Key')}</label>
               <input
                 type="password"
-                value={cfg.api_key}
+                value={draft.api_key}
                 placeholder={tr('sk-... (留空则不发送)', 'sk-... (leave empty to skip)')}
-                onChange={e => setCfg({ ...cfg, api_key: e.target.value })}
-                onBlur={e => save({ api_key: e.target.value })}
+                onChange={e => setDraft({ ...draft, api_key: e.target.value })}
                 disabled={saving}
                 autoComplete="off"
               />
             </div>
           )}
 
+          <div className="config-row">
+            <label>{tr('定时分析间隔', 'Scheduled Analysis')}</label>
+            <div className="config-inline-group">
+              <input
+                type="number"
+                min={0}
+                step={1}
+                value={draft.analysis_interval_hours}
+                onChange={e => setDraft({ ...draft, analysis_interval_hours: Math.max(0, parseInt(e.target.value || '0', 10) || 0) })}
+                disabled={saving}
+              />
+              <span className="config-inline-suffix">{tr('小时，0 表示关闭', 'hours, 0 disables')}</span>
+            </div>
+          </div>
+
           <div className="ai-config-hint">
-            {cfg.provider === 'ollama'
+            {draft.provider === 'ollama'
               ? tr('Ollama 本地模型无需 API Key，确保 Ollama 服务已启动并已拉取对应模型。', 'Ollama local models require no API key. Ensure Ollama is running and the model is pulled.')
               : tr('API Key 仅存储在服务端配置文件中，不会在前端明文显示。', 'API Key is stored only in the server-side config file and never shown in plaintext in the UI.')}
+          </div>
+
+          <div className="config-actions">
+            <button className="btn-primary" onClick={save} disabled={saving || !isDirty}>
+              {saving ? tr('保存中...', 'Saving...') : tr('保存配置', 'Save Config')}
+            </button>
+            <button
+              className="btn-ghost-sm"
+              onClick={triggerAnalysis}
+              disabled={triggering}
+            >
+              {triggering ? tr('触发中...', 'Triggering...') : tr('立即分析并推送微信', 'Analyze Now and Send to WeChat')}
+            </button>
+            {isDirty && (
+              <button
+                className="btn-ghost-sm"
+                onClick={() => setDraft(cfg)}
+                disabled={saving}
+              >
+                {tr('撤销修改', 'Discard Changes')}
+              </button>
+            )}
+          </div>
+
+          <div className="wechat-login-card">
+            <div className="wechat-login-header">
+              <div>
+                <h4>{tr('微信 ClawBot 登录', 'WeChat ClawBot Login')}</h4>
+                <p>{tr(
+                  '首次登录时需要扫码绑定，成功后凭证会保存，后续重启无需再次扫码。',
+                  'First login requires QR scanning. Credentials are persisted after success, so later restarts should not require scanning again.'
+                )}</p>
+              </div>
+              <span className={`card-badge ${wechatStatus?.logged_in ? '' : 'danger'}`}>
+                {wechatStatus?.logged_in
+                  ? tr('已登录', 'Logged In')
+                  : wechatStatus?.needs_qr_scan
+                    ? tr('待扫码', 'Scan Required')
+                    : tr('未连接', 'Offline')}
+              </span>
+            </div>
+
+            {wechatStatus?.logged_in ? (
+              <div className="wechat-login-meta">
+                <div><strong>{tr('账号', 'Account')}:</strong> {wechatStatus.account_id || '-'}</div>
+                <div><strong>User ID:</strong> {wechatStatus.user_id || '-'}</div>
+                <div><strong>{tr('状态更新时间', 'Updated')}:</strong> {wechatStatus.updated_at || '-'}</div>
+              </div>
+            ) : wechatStatus?.needs_qr_scan && wechatStatus.qr_url ? (
+              <div className="wechat-qr-block">
+                <img
+                  className="wechat-qr-image"
+                  src="/api/v1/ai/wechat/qr.svg"
+                  alt="WeChat login QR"
+                />
+                <div className="wechat-qr-meta">
+                  <p>{tr(
+                    '使用微信扫描二维码完成 ClawBot 登录。扫码成功后此区域会自动切换为已登录状态。',
+                    'Scan this QR code in WeChat to complete ClawBot login. This section will switch to logged-in automatically after success.'
+                  )}</p>
+                  <code className="wechat-qr-url">{wechatStatus.qr_url}</code>
+                </div>
+              </div>
+            ) : (
+              <div className="wechat-login-meta">
+                <div>{tr(
+                  '当前没有待扫码二维码。如果这是首次启动，请确认 gaia-notify 进程已运行。',
+                  'No pending QR code is available. If this is the first startup, make sure the gaia-notify process is running.'
+                )}</div>
+              </div>
+            )}
+
+            {wechatStatus?.last_error && (
+              <div className="wechat-login-error">
+                <strong>{tr('最近错误', 'Last Error')}:</strong> {wechatStatus.last_error}
+              </div>
+            )}
           </div>
         </div>
       )}

@@ -165,7 +165,9 @@ MODULE_INFO(livepatch, "Y");
     }
 
     // klp_object array
-    src.push_str(&format!("static struct klp_object {module_name}_objs[] = {{\n"));
+    src.push_str(&format!(
+        "static struct klp_object {module_name}_objs[] = {{\n"
+    ));
     for (obj_idx, (obj_name, _)) in obj_groups.iter().enumerate() {
         let arr_name = format!("{module_name}_funcs_{obj_idx}");
         let name_c = match obj_name {
@@ -329,18 +331,20 @@ pub async fn build_livepatch_module(
     // Write C source
     let src = generate_module_source(module_name, targets)?;
     let c_path = build_dir.join(format!("{module_name}.c"));
-    fs::write(&c_path, &src)
-        .with_context(|| format!("write {}", c_path.display()))?;
+    fs::write(&c_path, &src).with_context(|| format!("write {}", c_path.display()))?;
     info!("livepatch: wrote C source to {}", c_path.display());
 
     // Write Makefile
     let makefile = generate_makefile(module_name, &kernel_dir);
     let mk_path = build_dir.join("Makefile");
-    fs::write(&mk_path, &makefile)
-        .with_context(|| format!("write {}", mk_path.display()))?;
+    fs::write(&mk_path, &makefile).with_context(|| format!("write {}", mk_path.display()))?;
 
     // Build
-    info!("livepatch: building module {} in {}", module_name, build_dir.display());
+    info!(
+        "livepatch: building module {} in {}",
+        module_name,
+        build_dir.display()
+    );
     let output = Command::new("make")
         .current_dir(&build_dir)
         .output()
@@ -350,9 +354,7 @@ pub async fn build_livepatch_module(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        bail!(
-            "livepatch module build failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
+        bail!("livepatch module build failed:\nstdout:\n{stdout}\nstderr:\n{stderr}");
     }
 
     let ko_path = build_dir.join(format!("{module_name}.ko"));
@@ -407,13 +409,14 @@ pub async fn load_livepatch_module(module: &mut LivepatchModule) -> Result<()> {
 async fn is_module_loaded(name: &str) -> bool {
     // Module names in /proc/modules use underscores; hyphens become underscores too.
     let normalized = name.replace('-', "_");
-    let out = Command::new("lsmod").output().await.unwrap_or_else(|_| {
-        std::process::Output {
+    let out = Command::new("lsmod")
+        .output()
+        .await
+        .unwrap_or_else(|_| std::process::Output {
             status: std::process::ExitStatus::default(),
             stdout: vec![],
             stderr: vec![],
-        }
-    });
+        });
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .any(|line| line.split_whitespace().next() == Some(normalized.as_str()))
@@ -449,8 +452,7 @@ pub async fn unload_livepatch_module(module: &mut LivepatchModule) -> Result<()>
     let sysfs = format!("/sys/kernel/livepatch/{}/enabled", module.name);
     if Path::new(&sysfs).exists() {
         info!("livepatch: disabling {}", module.name);
-        fs::write(&sysfs, "0\n")
-            .with_context(|| format!("disable via {sysfs}"))?;
+        fs::write(&sysfs, "0\n").with_context(|| format!("disable via {sysfs}"))?;
         module.state = LivepatchState::Disabling;
 
         // Wait for the sysfs enabled flag to reach 0 (transition started).
@@ -509,9 +511,7 @@ async fn wait_for_transition(name: &str, target: bool, timeout: Duration) -> Res
 
     loop {
         if tokio::time::Instant::now() >= deadline {
-            bail!(
-                "timeout waiting for livepatch {name} to reach enabled={target_str}"
-            );
+            bail!("timeout waiting for livepatch {name} to reach enabled={target_str}");
         }
         let val = fs::read_to_string(&sysfs).unwrap_or_default();
         if val.trim() == target_str {
@@ -595,10 +595,7 @@ impl LivepatchManager {
 
     /// Build, load, and activate a new livepatch from `targets`.
     /// Returns the module name assigned.
-    pub async fn apply(
-        &mut self,
-        targets: &[KernelLivepatchTarget],
-    ) -> Result<String> {
+    pub async fn apply(&mut self, targets: &[KernelLivepatchTarget]) -> Result<String> {
         let name = format!("gaia_klp_{}", self.next_id);
         self.next_id += 1;
 
@@ -616,9 +613,10 @@ impl LivepatchManager {
 
     /// Disable and unload a livepatch by name.
     pub async fn remove(&mut self, name: &str) -> Result<()> {
-        let module = self.modules.get_mut(name).ok_or_else(|| {
-            anyhow!("livepatch module {name} not found")
-        })?;
+        let module = self
+            .modules
+            .get_mut(name)
+            .ok_or_else(|| anyhow!("livepatch module {name} not found"))?;
         unload_livepatch_module(module).await?;
         self.modules.remove(name);
         Ok(())
@@ -769,8 +767,14 @@ mod tests {
 
     #[test]
     fn replacement_func_name_format() {
-        assert_eq!(replacement_func_name("gaia_klp_0", 0), "gaia_klp_0_new_func_0");
-        assert_eq!(replacement_func_name("gaia_klp_0", 3), "gaia_klp_0_new_func_3");
+        assert_eq!(
+            replacement_func_name("gaia_klp_0", 0),
+            "gaia_klp_0_new_func_0"
+        );
+        assert_eq!(
+            replacement_func_name("gaia_klp_0", 3),
+            "gaia_klp_0_new_func_3"
+        );
     }
 
     #[test]
