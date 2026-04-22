@@ -49,10 +49,10 @@ port = 31337
 enabled = true
 
 [baseline_thresholds]
-file_io = 600000
-network = 160
-process = 80
 privilege = 20
+file_io = 600000
+process = 80
+network = 160
 hotpatch = 50
 
 [[hotpatch.targets]]
@@ -71,4 +71,4 @@ new_func_body = '''
     return 0;'''
 func_ret = "static int"
 func_args = "struct seq_file *m, void *v"
-enabled = false
+enabled = true

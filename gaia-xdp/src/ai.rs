@@ -426,7 +426,7 @@ pub(crate) async fn api_ai_chat(
                 let stream = agent.stream_chat(&prompt_text, history).await;
                 drain_stream!(stream);
             }
-            AiProvider::OpenAi | AiProvider::Custom => {
+            AiProvider::OpenAi => {
                 let client = match openai::Client::builder()
                     .api_key(cfg.api_key.trim())
                     .base_url(&base_url)
@@ -439,6 +439,26 @@ pub(crate) async fn api_ai_chat(
                     }
                 };
                 let agent = client
+                    .agent(cfg.model.as_str())
+                    .preamble(&system_prompt)
+                    .build();
+                let stream = agent.stream_chat(&prompt_text, history).await;
+                drain_stream!(stream);
+            }
+            AiProvider::Custom => {
+                let client = match openai::Client::builder()
+                    .api_key(cfg.api_key.trim())
+                    .base_url(&base_url)
+                    .build()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        send(&tx, format!("[rig build error: {e}]"), true);
+                        return;
+                    }
+                };
+                let agent = client
+                    .completions_api()
                     .agent(cfg.model.as_str())
                     .preamble(&system_prompt)
                     .build();
