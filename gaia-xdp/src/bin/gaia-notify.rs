@@ -3,7 +3,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -23,6 +23,7 @@ use tokio::{
     net::{UnixListener, UnixStream},
     sync::{RwLock, mpsc},
 };
+use tokio_rusqlite::{Connection as SqliteConn, params};
 use wechatbot::{
     BotOptions, Credentials, IncomingMessage, WeChatBot, protocol,
 };
@@ -32,6 +33,102 @@ const DEFAULT_CONFIG: &str = "gaia.toml";
 const DEFAULT_SOCKET: &str = "/tmp/gaia-ai-notify.sock";
 const DEFAULT_CONTROL_SOCKET: &str = "/tmp/gaia-ai-notify-control.sock";
 const RECENT_ALERT_CONTEXT: usize = 10;
+const ANALYSIS_HISTORY_WINDOW_MS: i64 = 24 * 3600 * 1000;
+const ANALYSIS_HISTORY_SUMMARY_LEN: usize = 500;
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+struct AnalysisDb {
+    conn: SqliteConn,
+}
+
+#[derive(Debug, Clone)]
+struct StoredAnalysis {
+    ts_ms: i64,
+    source: String,
+    alert_count: i64,
+    content: String,
+}
+
+impl AnalysisDb {
+    async fn open(path: &str) -> Result<Self> {
+        let conn = SqliteConn::open(path)
+            .await
+            .with_context(|| format!("open analysis db at {path}"))?;
+        conn.call(|c| {
+            c.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA synchronous=NORMAL;
+                 CREATE TABLE IF NOT EXISTS analysis_history (
+                   id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                   ts_ms       INTEGER NOT NULL,
+                   source      TEXT NOT NULL,
+                   alert_count INTEGER NOT NULL,
+                   content     TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_analysis_ts ON analysis_history(ts_ms);",
+            )?;
+            Ok(())
+        })
+        .await
+        .context("create analysis_history table")?;
+        Ok(Self { conn })
+    }
+
+    async fn insert_analysis(
+        &self,
+        ts_ms: i64,
+        source: &str,
+        alert_count: usize,
+        content: &str,
+    ) -> Result<()> {
+        let source = source.to_string();
+        let content = content.to_string();
+        let alert_count = alert_count as i64;
+        self.conn
+            .call(move |c| {
+                c.execute(
+                    "INSERT INTO analysis_history (ts_ms, source, alert_count, content) VALUES (?1,?2,?3,?4)",
+                    params![ts_ms, source, alert_count, content],
+                )?;
+                Ok(())
+            })
+            .await
+            .context("insert analysis")?;
+        Ok(())
+    }
+
+    async fn query_recent(&self, since_ms: i64) -> Result<Vec<StoredAnalysis>> {
+        self.conn
+            .call(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT ts_ms, source, alert_count, content
+                     FROM analysis_history
+                     WHERE ts_ms >= ?1
+                     ORDER BY ts_ms ASC",
+                )?;
+                let rows = stmt
+                    .query_map(params![since_ms], |row| {
+                        Ok(StoredAnalysis {
+                            ts_ms: row.get(0)?,
+                            source: row.get(1)?,
+                            alert_count: row.get(2)?,
+                            content: row.get(3)?,
+                        })
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok(rows)
+            })
+            .await
+            .context("query recent analyses")
+    }
+}
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -230,6 +327,12 @@ async fn main() -> Result<()> {
     let contexts = Arc::new(RwLock::new(initial_contexts));
     let recent_alerts = Arc::new(RwLock::new(VecDeque::<AiAlertNotification>::new()));
 
+    let db_path = analysis_db_path(&opt.config);
+    let analysis_db = Arc::new(
+        AnalysisDb::open(db_path.to_str().unwrap_or("gaia-analysis.db")).await?,
+    );
+    info!("opened analysis history db: {}", db_path.display());
+
     let (bot_tx, bot_rx) = mpsc::unbounded_channel::<BotCommand>();
 
     spawn_control_socket_server(opt.control_socket_path.clone(), bot_tx.clone());
@@ -245,12 +348,19 @@ async fn main() -> Result<()> {
             contexts_path.clone(),
             status_path.clone(),
             recent_alerts.clone(),
+            analysis_db.clone(),
             bot_tx.clone(),
             bot_rx,
         )
         .await?;
     } else {
         info!("wechat notification runtime disabled by config");
+        let no_wechat_alerts = recent_alerts.clone();
+        let no_wechat_db = analysis_db.clone();
+        let no_wechat_config = opt.config.clone();
+        tokio::spawn(async move {
+            run_bot_actor_no_wechat(no_wechat_config, no_wechat_alerts, no_wechat_db, bot_rx).await;
+        });
     }
 
     consume_alert_socket(opt.socket_path, recent_alerts).await
@@ -275,6 +385,15 @@ fn ai_config_path(config_path: &Path) -> PathBuf {
         .unwrap_or("toml");
     let parent = config_path.parent().unwrap_or(Path::new("."));
     parent.join(format!("{stem}-ai.{ext}"))
+}
+
+fn analysis_db_path(config_path: &Path) -> PathBuf {
+    let stem = config_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("gaia");
+    let parent = config_path.parent().unwrap_or(Path::new("."));
+    parent.join(format!("{stem}-analysis.db"))
 }
 
 fn load_notify_config(config_path: &Path) -> NotifyConfig {
@@ -548,6 +667,7 @@ async fn start_bot_runtime(
     contexts_path: PathBuf,
     status_path: PathBuf,
     recent_alerts: Arc<RwLock<VecDeque<AiAlertNotification>>>,
+    analysis_db: Arc<AnalysisDb>,
     tx: mpsc::UnboundedSender<BotCommand>,
     rx: mpsc::UnboundedReceiver<BotCommand>,
 ) -> Result<()> {
@@ -664,6 +784,7 @@ async fn start_bot_runtime(
             subscribers_path,
             contexts_path,
             recent_alerts,
+            analysis_db,
             rx,
         )
         .await;
@@ -687,6 +808,7 @@ async fn run_bot_actor(
     subscribers_path: PathBuf,
     _contexts_path: PathBuf,
     recent_alerts: Arc<RwLock<VecDeque<AiAlertNotification>>>,
+    analysis_db: Arc<AnalysisDb>,
     mut rx: mpsc::UnboundedReceiver<BotCommand>,
 ) {
     while let Some(cmd) = rx.recv().await {
@@ -717,7 +839,7 @@ async fn run_bot_actor(
                     drop(guard);
 
                     match bot
-                        .send(user_id.as_str(), "已收到分析请求，结果会通过微信推送。")
+                        .send(user_id.as_str(), "已收到分析请求，正在结合历史记录分析，结果会通过微信推送。")
                         .await
                     {
                         Ok(_) => info!("sent analysis ack to user_id={}", user_id),
@@ -727,17 +849,29 @@ async fn run_bot_actor(
                     }
                     let ai_cfg = load_ai_runtime_config(&config_path);
                     let notify_cfg = load_notify_config(&config_path);
-                    let analysis = match analyze_recent_alerts(
+                    let since_ms = now_ms() - ANALYSIS_HISTORY_WINDOW_MS;
+                    let history = analysis_db.query_recent(since_ms).await.unwrap_or_else(|err| {
+                        warn!("failed to query analysis history: {err:#}");
+                        Vec::new()
+                    });
+                    info!(
+                        "loaded analysis history for wechat query: user_id={} history_count={} since_ms={}",
+                        user_id,
+                        history.len(),
+                        since_ms,
+                    );
+                    let analysis = match analyze_with_history(
                         &ai_cfg,
                         &notify_cfg.analysis_prompt,
                         &recent_alerts,
+                        &history,
                         "wechat_command",
                     )
                     .await
                     {
                         Ok(text) => text,
                         Err(err) => {
-                            warn!("AI analysis failed, falling back to summary: {err:#}");
+                            warn!("AI analysis with history failed, falling back to summary: {err:#}");
                             fallback_summary_from_recent(&recent_alerts).await
                         }
                     };
@@ -802,9 +936,10 @@ async fn run_bot_actor(
                 }
             }
             BotCommand::TriggerAnalysis { source } => {
-                info!("processing trigger analysis command: source={}", source);
+                info!("processing trigger analysis command (save-only): source={}", source);
                 let ai_cfg = load_ai_runtime_config(&config_path);
                 let notify_cfg = load_notify_config(&config_path);
+                let alert_count = recent_alerts.read().await.len();
                 let analysis = match analyze_recent_alerts(
                     &ai_cfg,
                     &notify_cfg.analysis_prompt,
@@ -819,13 +954,17 @@ async fn run_bot_actor(
                         fallback_summary_from_recent(&recent_alerts).await
                     }
                 };
-                info!(
-                    "triggered analysis ready for broadcast: source={} analysis_len={}",
-                    source,
-                    analysis.len(),
-                );
-                broadcast_to_subscribers(&creds, &subscribers, &contexts, &source, &analysis)
-                    .await;
+                let ts = now_ms();
+                if let Err(err) = analysis_db.insert_analysis(ts, &source, alert_count, &analysis).await {
+                    warn!("failed to save analysis to db: source={} err={:#}", source, err);
+                } else {
+                    info!(
+                        "saved analysis to db: source={} alert_count={} analysis_len={}",
+                        source,
+                        alert_count,
+                        analysis.len(),
+                    );
+                }
             }
         }
     }
@@ -960,6 +1099,100 @@ Give a compact operator-facing response in Simplified Chinese with exactly three
         "GAIA 高危告警批量分析\n\n触发来源: {}\n告警数量: {}\n\n{}",
         source,
         recent_snapshot.len(),
+        content
+    ))
+}
+
+async fn analyze_with_history(
+    cfg: &AiRuntimeConfig,
+    analysis_prompt: &str,
+    recent_alerts: &Arc<RwLock<VecDeque<AiAlertNotification>>>,
+    history: &[StoredAnalysis],
+    source: &str,
+) -> Result<String> {
+    if !cfg.enabled {
+        return Ok(fallback_summary_from_recent(recent_alerts).await);
+    }
+
+    let recent_snapshot = {
+        let guard = recent_alerts.read().await;
+        guard.iter().take(RECENT_ALERT_CONTEXT).cloned().collect::<Vec<_>>()
+    };
+
+    let recent_lines = recent_snapshot
+        .iter()
+        .map(|item| {
+            format!(
+                "[{}] level={} kind={} action={} pid={} comm={} reason={} detail={}",
+                item.timestamp, item.level, item.event_kind, item.event_action,
+                item.pid, item.comm, item.reason, item.detail,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut system_prompt = String::from(
+        "You are GAIA's incident triage assistant. Analyze the recent high-risk alerts as a batch, \
+taking into account the historical analysis records from the past 24 hours. \
+Give a compact operator-facing response in Simplified Chinese with exactly three sections: \
+`风险判断`, `依据`, `处置建议`. Be specific and avoid generic filler.",
+    );
+    if !analysis_prompt.trim().is_empty() {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(analysis_prompt.trim());
+    }
+
+    let history_section = if history.is_empty() {
+        "过去 24 小时内无历史分析记录。".to_string()
+    } else {
+        let entries = history
+            .iter()
+            .map(|h| {
+                let ts_secs = h.ts_ms / 1000;
+                let summary = if h.content.len() > ANALYSIS_HISTORY_SUMMARY_LEN {
+                    format!("{}…", &h.content[..ANALYSIS_HISTORY_SUMMARY_LEN])
+                } else {
+                    h.content.clone()
+                };
+                format!(
+                    "[ts={}] 来源={} 告警数={}\n{}",
+                    ts_secs, h.source, h.alert_count, summary
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n---\n");
+        format!("过去 24 小时内共 {} 次分析记录：\n{}", history.len(), entries)
+    };
+
+    let user_prompt = format!(
+        "查询来源: {}\n\
+最近高危告警总数: {}\n\n\
+最近相关高危告警:\n{}\n\n\
+历史分析参考:\n{}",
+        source,
+        recent_snapshot.len(),
+        if recent_lines.is_empty() { "None".to_string() } else { recent_lines },
+        history_section,
+    );
+
+    info!(
+        "AI analysis with history: source={source} alert_count={} history_count={} user_prompt_len={}",
+        recent_snapshot.len(),
+        history.len(),
+        user_prompt.len(),
+    );
+
+    let content = run_llm_analysis_with_rig(cfg, &system_prompt, &user_prompt).await?;
+
+    if content.is_empty() {
+        anyhow::bail!("empty LLM response");
+    }
+
+    Ok(format!(
+        "GAIA 综合分析（含 24h 历史）\n\n查询来源: {}\n当前告警数: {}\n历史分析条数: {}\n\n{}",
+        source,
+        recent_snapshot.len(),
+        history.len(),
         content
     ))
 }
@@ -1346,6 +1579,46 @@ async fn broadcast_to_subscribers(
                 user_id
             ),
             Err(err) => warn!("failed to send alert to {user_id}: {err:#}"),
+        }
+    }
+}
+
+// Handles TriggerAnalysis commands when WeChat is disabled — saves analysis to DB only.
+async fn run_bot_actor_no_wechat(
+    config_path: PathBuf,
+    recent_alerts: Arc<RwLock<VecDeque<AiAlertNotification>>>,
+    analysis_db: Arc<AnalysisDb>,
+    mut rx: mpsc::UnboundedReceiver<BotCommand>,
+) {
+    while let Some(cmd) = rx.recv().await {
+        if let BotCommand::TriggerAnalysis { source } = cmd {
+            info!("processing trigger analysis command (no-wechat save-only): source={}", source);
+            let ai_cfg = load_ai_runtime_config(&config_path);
+            let notify_cfg = load_notify_config(&config_path);
+            let alert_count = recent_alerts.read().await.len();
+            let analysis = match analyze_recent_alerts(
+                &ai_cfg,
+                &notify_cfg.analysis_prompt,
+                &recent_alerts,
+                &source,
+            )
+            .await
+            {
+                Ok(text) => text,
+                Err(err) => {
+                    warn!("AI analysis failed (no-wechat), falling back to summary: {err:#}");
+                    fallback_summary_from_recent(&recent_alerts).await
+                }
+            };
+            let ts = now_ms();
+            if let Err(err) = analysis_db.insert_analysis(ts, &source, alert_count, &analysis).await {
+                warn!("failed to save analysis to db (no-wechat): source={} err={:#}", source, err);
+            } else {
+                info!(
+                    "saved analysis to db (no-wechat): source={} alert_count={} analysis_len={}",
+                    source, alert_count, analysis.len(),
+                );
+            }
         }
     }
 }
