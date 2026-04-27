@@ -1,2 +1,8 @@
 [target."cfg(all())"]
 runner = "sudo -E"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+
