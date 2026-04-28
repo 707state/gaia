@@ -49,11 +49,11 @@ port = 31337
 enabled = true
 
 [baseline_thresholds]
+hotpatch = 50
 privilege = 20
 file_io = 600000
-process = 80
 network = 160
-hotpatch = 50
+process = 80
 
 [[hotpatch.targets]]
 binary = "/home/jask/lua"

@@ -353,10 +353,7 @@ pub(crate) async fn api_ai_chat(
     }
 
     // Find the last user message to use as the prompt; everything before it is history.
-    let last_user_idx = req
-        .messages
-        .iter()
-        .rposition(|m| m.role == "user");
+    let last_user_idx = req.messages.iter().rposition(|m| m.role == "user");
     let Some(user_idx) = last_user_idx else {
         return (StatusCode::BAD_REQUEST, "no user message in request").into_response();
     };

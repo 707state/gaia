@@ -8,8 +8,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use log::{error, info, warn};
 use futures_util::StreamExt as FuturesStreamExt;
+use log::{error, info, warn};
 use rig::{
     agent::{MultiTurnStreamItem, StreamingResult},
     client::{CompletionClient, Nothing},
@@ -24,10 +24,7 @@ use tokio::{
     sync::{RwLock, mpsc},
 };
 use tokio_rusqlite::{Connection as SqliteConn, params};
-use wechatbot::{
-    BotOptions, Credentials, IncomingMessage, WeChatBot, protocol,
-};
-
+use wechatbot::{BotOptions, Credentials, IncomingMessage, WeChatBot, protocol};
 
 const DEFAULT_CONFIG: &str = "gaia.toml";
 const DEFAULT_SOCKET: &str = "/tmp/gaia-ai-notify.sock";
@@ -328,9 +325,8 @@ async fn main() -> Result<()> {
     let recent_alerts = Arc::new(RwLock::new(VecDeque::<AiAlertNotification>::new()));
 
     let db_path = analysis_db_path(&opt.config);
-    let analysis_db = Arc::new(
-        AnalysisDb::open(db_path.to_str().unwrap_or("gaia-analysis.db")).await?,
-    );
+    let analysis_db =
+        Arc::new(AnalysisDb::open(db_path.to_str().unwrap_or("gaia-analysis.db")).await?);
     info!("opened analysis history db: {}", db_path.display());
 
     let (bot_tx, bot_rx) = mpsc::unbounded_channel::<BotCommand>();
@@ -451,8 +447,8 @@ fn contexts_path(config_path: &Path) -> PathBuf {
 fn load_contexts(path: &Path) -> BTreeMap<String, WechatContextEntry> {
     match fs::read_to_string(path) {
         Ok(raw) => {
-            let contexts =
-                serde_json::from_str::<BTreeMap<String, WechatContextEntry>>(&raw).unwrap_or_default();
+            let contexts = serde_json::from_str::<BTreeMap<String, WechatContextEntry>>(&raw)
+                .unwrap_or_default();
             info!(
                 "loaded wechat context file: path={} count={} users={:?}",
                 path.display(),
@@ -484,7 +480,10 @@ fn persist_contexts(path: &Path, contexts: &BTreeMap<String, WechatContextEntry>
     match serde_json::to_string_pretty(contexts) {
         Ok(body) => {
             if let Err(err) = fs::write(path, body) {
-                warn!("failed to persist wechat contexts {}: {err:#}", path.display());
+                warn!(
+                    "failed to persist wechat contexts {}: {err:#}",
+                    path.display()
+                );
             } else {
                 info!(
                     "persisted wechat context file: path={} count={} users={:?}",
@@ -762,8 +761,7 @@ async fn start_bot_runtime(
     bot.on_message(Box::new(move |msg| {
         info!(
             "wechat on_message callback fired: user_id={} text={:?}",
-            msg.user_id,
-            msg.text,
+            msg.user_id, msg.text,
         );
         persist_incoming_context(&message_contexts, &message_contexts_path, msg);
         let _ = message_tx.send(BotCommand::SeenUser {
@@ -816,15 +814,17 @@ async fn run_bot_actor(
             BotCommand::SeenUser { user_id, text } => {
                 info!(
                     "received wechat user message: user_id={} raw_text={:?}",
-                    user_id,
-                    text,
+                    user_id, text,
                 );
                 let lowered = text.trim().to_ascii_lowercase();
                 if matches!(
                     lowered.as_str(),
                     "/analyze" | "analyze" | "分析" | "立即分析"
                 ) {
-                    info!("processing manual analysis command from user_id={}", user_id);
+                    info!(
+                        "processing manual analysis command from user_id={}",
+                        user_id
+                    );
                     let mut guard = subscribers.write().await;
                     let inserted = guard.insert(user_id.clone());
                     info!(
@@ -839,7 +839,10 @@ async fn run_bot_actor(
                     drop(guard);
 
                     match bot
-                        .send(user_id.as_str(), "已收到分析请求，正在结合历史记录分析，结果会通过微信推送。")
+                        .send(
+                            user_id.as_str(),
+                            "已收到分析请求，正在结合历史记录分析，结果会通过微信推送。",
+                        )
                         .await
                     {
                         Ok(_) => info!("sent analysis ack to user_id={}", user_id),
@@ -850,10 +853,13 @@ async fn run_bot_actor(
                     let ai_cfg = load_ai_runtime_config(&config_path);
                     let notify_cfg = load_notify_config(&config_path);
                     let since_ms = now_ms() - ANALYSIS_HISTORY_WINDOW_MS;
-                    let history = analysis_db.query_recent(since_ms).await.unwrap_or_else(|err| {
-                        warn!("failed to query analysis history: {err:#}");
-                        Vec::new()
-                    });
+                    let history = analysis_db
+                        .query_recent(since_ms)
+                        .await
+                        .unwrap_or_else(|err| {
+                            warn!("failed to query analysis history: {err:#}");
+                            Vec::new()
+                        });
                     info!(
                         "loaded analysis history for wechat query: user_id={} history_count={} since_ms={}",
                         user_id,
@@ -871,7 +877,9 @@ async fn run_bot_actor(
                     {
                         Ok(text) => text,
                         Err(err) => {
-                            warn!("AI analysis with history failed, falling back to summary: {err:#}");
+                            warn!(
+                                "AI analysis with history failed, falling back to summary: {err:#}"
+                            );
                             fallback_summary_from_recent(&recent_alerts).await
                         }
                     };
@@ -907,7 +915,10 @@ async fn run_bot_actor(
                         "当前未处于订阅状态。".to_string()
                     }
                 } else {
-                    info!("processing normal/status command from user_id={} lowered={}", user_id, lowered);
+                    info!(
+                        "processing normal/status command from user_id={} lowered={}",
+                        user_id, lowered
+                    );
                     let mut guard = subscribers.write().await;
                     let inserted = guard.insert(user_id.clone());
                     info!(
@@ -920,7 +931,11 @@ async fn run_bot_actor(
                         persist_subscribers(&subscribers_path, &guard);
                     }
                     if matches!(lowered.as_str(), "/status" | "status") {
-                        format!("当前已订阅。订阅用户数：{}，已记录会话上下文数：{}", guard.len(), contexts.read().await.len())
+                        format!(
+                            "当前已订阅。订阅用户数：{}，已记录会话上下文数：{}",
+                            guard.len(),
+                            contexts.read().await.len()
+                        )
                     } else {
                         "已接入 GAIA 高危告警推送。后续 WebUI 手动分析与定时分析会主动推送到微信。发送 /unsubscribe 可取消订阅，发送 /status 查看状态。".to_string()
                     }
@@ -936,7 +951,10 @@ async fn run_bot_actor(
                 }
             }
             BotCommand::TriggerAnalysis { source } => {
-                info!("processing trigger analysis command (save-only): source={}", source);
+                info!(
+                    "processing trigger analysis command (save-only): source={}",
+                    source
+                );
                 let ai_cfg = load_ai_runtime_config(&config_path);
                 let notify_cfg = load_notify_config(&config_path);
                 let alert_count = recent_alerts.read().await.len();
@@ -955,8 +973,14 @@ async fn run_bot_actor(
                     }
                 };
                 let ts = now_ms();
-                if let Err(err) = analysis_db.insert_analysis(ts, &source, alert_count, &analysis).await {
-                    warn!("failed to save analysis to db: source={} err={:#}", source, err);
+                if let Err(err) = analysis_db
+                    .insert_analysis(ts, &source, alert_count, &analysis)
+                    .await
+                {
+                    warn!(
+                        "failed to save analysis to db: source={} err={:#}",
+                        source, err
+                    );
                 } else {
                     info!(
                         "saved analysis to db: source={} alert_count={} analysis_len={}",
@@ -1116,7 +1140,11 @@ async fn analyze_with_history(
 
     let recent_snapshot = {
         let guard = recent_alerts.read().await;
-        guard.iter().take(RECENT_ALERT_CONTEXT).cloned().collect::<Vec<_>>()
+        guard
+            .iter()
+            .take(RECENT_ALERT_CONTEXT)
+            .cloned()
+            .collect::<Vec<_>>()
     };
 
     let recent_lines = recent_snapshot
@@ -1124,8 +1152,14 @@ async fn analyze_with_history(
         .map(|item| {
             format!(
                 "[{}] level={} kind={} action={} pid={} comm={} reason={} detail={}",
-                item.timestamp, item.level, item.event_kind, item.event_action,
-                item.pid, item.comm, item.reason, item.detail,
+                item.timestamp,
+                item.level,
+                item.event_kind,
+                item.event_action,
+                item.pid,
+                item.comm,
+                item.reason,
+                item.detail,
             )
         })
         .collect::<Vec<_>>()
@@ -1161,7 +1195,11 @@ Give a compact operator-facing response in Simplified Chinese with exactly three
             })
             .collect::<Vec<_>>()
             .join("\n---\n");
-        format!("过去 24 小时内共 {} 次分析记录：\n{}", history.len(), entries)
+        format!(
+            "过去 24 小时内共 {} 次分析记录：\n{}",
+            history.len(),
+            entries
+        )
     };
 
     let user_prompt = format!(
@@ -1171,7 +1209,11 @@ Give a compact operator-facing response in Simplified Chinese with exactly three
 历史分析参考:\n{}",
         source,
         recent_snapshot.len(),
-        if recent_lines.is_empty() { "None".to_string() } else { recent_lines },
+        if recent_lines.is_empty() {
+            "None".to_string()
+        } else {
+            recent_lines
+        },
         history_section,
     );
 
@@ -1217,7 +1259,10 @@ async fn run_llm_analysis_with_rig(
                 builder = builder.base_url(&resolved_base_url);
             }
             let client = builder.build().context("build rig ollama client failed")?;
-            let agent = client.agent(cfg.model.as_str()).preamble(system_prompt).build();
+            let agent = client
+                .agent(cfg.model.as_str())
+                .preamble(system_prompt)
+                .build();
             info!("dispatching rig ollama stream_chat request");
             let stream = agent.stream_chat(user_prompt, Vec::<Message>::new()).await;
             collect_streamed_response(stream, "rig ollama chat failed").await
@@ -1235,7 +1280,10 @@ async fn run_llm_analysis_with_rig(
                 .base_url(&resolved_base_url)
                 .build()
                 .context("build rig openai responses client failed")?;
-            let agent = client.agent(cfg.model.as_str()).preamble(system_prompt).build();
+            let agent = client
+                .agent(cfg.model.as_str())
+                .preamble(system_prompt)
+                .build();
             info!("dispatching rig openai responses stream_chat request");
             let stream = agent.stream_chat(user_prompt, Vec::<Message>::new()).await;
             collect_streamed_response(stream, "rig openai responses chat failed").await
@@ -1254,7 +1302,10 @@ async fn run_llm_analysis_with_rig(
                 .build()
                 .context("build rig openai-compatible client failed")?
                 .completions_api();
-            let agent = client.agent(cfg.model.as_str()).preamble(system_prompt).build();
+            let agent = client
+                .agent(cfg.model.as_str())
+                .preamble(system_prompt)
+                .build();
             info!("dispatching rig openai-compatible completions stream_chat request");
             let stream = agent.stream_chat(user_prompt, Vec::<Message>::new()).await;
             collect_streamed_response(stream, "rig openai-compatible chat failed").await
@@ -1290,29 +1341,38 @@ where
                     r.content.len(),
                 );
             }
-            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ReasoningDelta { reasoning, .. }) => {
+            MultiTurnStreamItem::StreamAssistantItem(
+                StreamedAssistantContent::ReasoningDelta { reasoning, .. },
+            ) => {
                 info!(
                     "LLM reasoning delta received: err_ctx={} chunk_len={}",
                     err_ctx,
                     reasoning.len(),
                 );
             }
-            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall { tool_call, .. }) => {
+            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
+                tool_call,
+                ..
+            }) => {
                 warn!(
                     "LLM unexpectedly emitted tool call during notify analysis: err_ctx={} tool_name={}",
-                    err_ctx,
-                    tool_call.function.name,
+                    err_ctx, tool_call.function.name,
                 );
             }
-            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCallDelta { id, .. }) => {
+            MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCallDelta {
+                id,
+                ..
+            }) => {
                 warn!(
                     "LLM unexpectedly emitted tool call delta during notify analysis: err_ctx={} tool_call_id={}",
-                    err_ctx,
-                    id,
+                    err_ctx, id,
                 );
             }
             MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Final(_)) => {
-                info!("LLM stream final usage marker received: err_ctx={}", err_ctx);
+                info!(
+                    "LLM stream final usage marker received: err_ctx={}",
+                    err_ctx
+                );
             }
             MultiTurnStreamItem::StreamUserItem(_) => {
                 warn!(
@@ -1364,8 +1424,7 @@ fn persist_incoming_context(
     if msg.context_token().is_empty() {
         warn!(
             "incoming wechat message missing context token: user_id={} text={:?}",
-            msg.user_id,
-            msg.text,
+            msg.user_id, msg.text,
         );
         return;
     }
@@ -1414,11 +1473,7 @@ async fn send_wechat_text_via_context(
     Ok(())
 }
 
-async fn send_wechat_text_direct(
-    creds: &Credentials,
-    user_id: &str,
-    text: &str,
-) -> Result<()> {
+async fn send_wechat_text_direct(creds: &Credentials, user_id: &str, text: &str) -> Result<()> {
     let client = wechatbot::protocol::ILinkClient::new();
     for chunk in split_wechat_text(text, 4000) {
         let msg = protocol::build_text_message(user_id, "", &chunk);
@@ -1446,8 +1501,18 @@ fn split_wechat_text(text: &str, limit: usize) -> Vec<String> {
             .rfind("\n\n")
             .filter(|&i| i > limit * 3 / 10)
             .map(|i| i + 2)
-            .or_else(|| window.rfind('\n').filter(|&i| i > limit * 3 / 10).map(|i| i + 1))
-            .or_else(|| window.rfind(' ').filter(|&i| i > limit * 3 / 10).map(|i| i + 1))
+            .or_else(|| {
+                window
+                    .rfind('\n')
+                    .filter(|&i| i > limit * 3 / 10)
+                    .map(|i| i + 1)
+            })
+            .or_else(|| {
+                window
+                    .rfind(' ')
+                    .filter(|&i| i > limit * 3 / 10)
+                    .map(|i| i + 1)
+            })
             .unwrap_or(limit);
         chunks.push(remaining[..cut].to_string());
         remaining = &remaining[cut..];
@@ -1517,8 +1582,7 @@ async fn broadcast_to_subscribers(
     if targets.is_empty() {
         info!(
             "wechat broadcast has no subscribers, falling back to logged-in wechat user: source={} fallback_user={}",
-            source,
-            creds.user_id,
+            source, creds.user_id,
         );
         if !creds.user_id.trim().is_empty() {
             targets.push(creds.user_id.clone());
@@ -1552,31 +1616,26 @@ async fn broadcast_to_subscribers(
                 Ok(_) => {
                     info!(
                         "wechat broadcast send succeeded via persisted context: source={} target={}",
-                        source,
-                        user_id
+                        source, user_id
                     );
                     continue;
                 }
                 Err(err) => warn!(
                     "send via persisted context failed, trying direct push: source={} target={} err={:#}",
-                    source,
-                    user_id,
-                    err
+                    source, user_id, err
                 ),
             }
         } else {
             warn!(
                 "no persisted context for target, trying direct push: source={} target={}",
-                source,
-                user_id,
+                source, user_id,
             );
         }
 
         match send_wechat_text_direct(creds, &user_id, text).await {
             Ok(_) => info!(
                 "wechat broadcast direct send succeeded: source={} target={}",
-                source,
-                user_id
+                source, user_id
             ),
             Err(err) => warn!("failed to send alert to {user_id}: {err:#}"),
         }
@@ -1592,7 +1651,10 @@ async fn run_bot_actor_no_wechat(
 ) {
     while let Some(cmd) = rx.recv().await {
         if let BotCommand::TriggerAnalysis { source } = cmd {
-            info!("processing trigger analysis command (no-wechat save-only): source={}", source);
+            info!(
+                "processing trigger analysis command (no-wechat save-only): source={}",
+                source
+            );
             let ai_cfg = load_ai_runtime_config(&config_path);
             let notify_cfg = load_notify_config(&config_path);
             let alert_count = recent_alerts.read().await.len();
@@ -1611,12 +1673,20 @@ async fn run_bot_actor_no_wechat(
                 }
             };
             let ts = now_ms();
-            if let Err(err) = analysis_db.insert_analysis(ts, &source, alert_count, &analysis).await {
-                warn!("failed to save analysis to db (no-wechat): source={} err={:#}", source, err);
+            if let Err(err) = analysis_db
+                .insert_analysis(ts, &source, alert_count, &analysis)
+                .await
+            {
+                warn!(
+                    "failed to save analysis to db (no-wechat): source={} err={:#}",
+                    source, err
+                );
             } else {
                 info!(
                     "saved analysis to db (no-wechat): source={} alert_count={} analysis_len={}",
-                    source, alert_count, analysis.len(),
+                    source,
+                    alert_count,
+                    analysis.len(),
                 );
             }
         }

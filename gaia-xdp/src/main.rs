@@ -4,6 +4,7 @@ use std::{
     fs,
     mem::size_of,
     net::Ipv4Addr,
+    num::NonZeroU32,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -23,7 +24,7 @@ use axum::{
 use aya::{
     Ebpf,
     maps::{Array as BpfArray, HashMap as BpfHashMap, MapData, ring_buf::RingBuf},
-    programs::{CgroupAttachMode, CgroupSockAddr, KProbe, TracePoint, UProbe},
+    programs::{CgroupAttachMode, CgroupSockAddr, KProbe, TracePoint, UProbe, uprobe::UProbeScope},
 };
 use clap::Parser;
 use gaia_xdp_common::{
@@ -1189,8 +1190,14 @@ fn attach_hotpatch_targets(
                 .context("missing")?
                 .try_into()
                 .context("cast")?;
+            let scope = match target.pid {
+                Some(pid) => {
+                    UProbeScope::OneProcess(NonZeroU32::new(pid).expect("pid must be non-zero"))
+                }
+                None => UProbeScope::AllProcesses,
+            };
             entry
-                .attach(target.symbol.as_str(), &target.binary, target.pid)
+                .attach(target.symbol.as_str(), &target.binary, scope)
                 .context("attach")?;
             Ok(())
         })() {
@@ -1208,7 +1215,13 @@ fn attach_hotpatch_targets(
                 .context("missing")?
                 .try_into()
                 .context("cast")?;
-            exit.attach(target.symbol.as_str(), &target.binary, target.pid)
+            let scope = match target.pid {
+                Some(pid) => {
+                    UProbeScope::OneProcess(NonZeroU32::new(pid).expect("pid must be non-zero"))
+                }
+                None => UProbeScope::AllProcesses,
+            };
+            exit.attach(target.symbol.as_str(), &target.binary, scope)
                 .context("attach")?;
             Ok(())
         })() {
