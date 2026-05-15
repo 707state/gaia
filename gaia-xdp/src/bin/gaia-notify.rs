@@ -797,9 +797,36 @@ async fn start_bot_runtime(
     Ok(())
 }
 
+fn parse_analyze_command(text: &str) -> Option<&str> {
+    let lowered = text.to_ascii_lowercase();
+    for command in ["/analyze", "analyze"] {
+        if lowered == command {
+            return Some("");
+        }
+        if lowered.starts_with(command) {
+            let rest = &text[command.len()..];
+            if rest
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_whitespace() || !c.is_ascii())
+            {
+                return Some(rest.trim());
+            }
+        }
+    }
+
+    for command in ["立即分析", "分析"] {
+        if let Some(rest) = text.strip_prefix(command) {
+            return Some(rest.trim());
+        }
+    }
+
+    None
+}
+
 async fn run_bot_actor(
     bot: Arc<WeChatBot>,
-    creds: Credentials,
+    _creds: Credentials,
     config_path: PathBuf,
     subscribers: Arc<RwLock<BTreeSet<String>>>,
     contexts: Arc<RwLock<BTreeMap<String, WechatContextEntry>>>,
@@ -816,14 +843,12 @@ async fn run_bot_actor(
                     "received wechat user message: user_id={} raw_text={:?}",
                     user_id, text,
                 );
-                let lowered = text.trim().to_ascii_lowercase();
-                if matches!(
-                    lowered.as_str(),
-                    "/analyze" | "analyze" | "分析" | "立即分析"
-                ) {
+                let trimmed = text.trim();
+                let lowered = trimmed.to_ascii_lowercase();
+                if let Some(query) = parse_analyze_command(trimmed) {
                     info!(
-                        "processing manual analysis command from user_id={}",
-                        user_id
+                        "processing manual analysis command from user_id={} query={:?}",
+                        user_id, query
                     );
                     let mut guard = subscribers.write().await;
                     let inserted = guard.insert(user_id.clone());
@@ -838,18 +863,11 @@ async fn run_bot_actor(
                     }
                     drop(guard);
 
-                    match bot
-                        .send(
-                            user_id.as_str(),
-                            "已收到分析请求，正在结合历史记录分析，结果会通过微信推送。",
-                        )
-                        .await
-                    {
-                        Ok(_) => info!("sent analysis ack to user_id={}", user_id),
-                        Err(err) => {
-                            warn!("failed to send analysis ack to {user_id}: {err:#}");
-                        }
-                    }
+                    let analysis_source = if query.is_empty() {
+                        "wechat_command".to_string()
+                    } else {
+                        format!("wechat_command: {query}")
+                    };
                     let ai_cfg = load_ai_runtime_config(&config_path);
                     let notify_cfg = load_notify_config(&config_path);
                     let since_ms = now_ms() - ANALYSIS_HISTORY_WINDOW_MS;
@@ -871,7 +889,7 @@ async fn run_bot_actor(
                         &notify_cfg.analysis_prompt,
                         &recent_alerts,
                         &history,
-                        "wechat_command",
+                        &analysis_source,
                     )
                     .await
                     {
@@ -884,18 +902,20 @@ async fn run_bot_actor(
                         }
                     };
                     info!(
-                        "manual analysis ready for broadcast: user_id={} analysis_len={}",
+                        "manual analysis ready for direct reply: user_id={} analysis_len={}",
                         user_id,
                         analysis.len(),
                     );
-                    broadcast_to_subscribers(
-                        &creds,
-                        &subscribers,
-                        &contexts,
-                        "wechat_command",
-                        &analysis,
-                    )
-                    .await;
+                    match bot.send(user_id.as_str(), analysis.as_str()).await {
+                        Ok(_) => info!(
+                            "sent manual analysis reply to user_id={} reply_len={}",
+                            user_id,
+                            analysis.len(),
+                        ),
+                        Err(err) => {
+                            warn!("failed to send manual analysis reply to {user_id}: {err:#}")
+                        }
+                    }
                     continue;
                 }
                 let reply = if matches!(lowered.as_str(), "/unsubscribe" | "unsubscribe" | "stop") {
@@ -910,9 +930,9 @@ async fn run_bot_actor(
                     );
                     if removed {
                         persist_subscribers(&subscribers_path, &guard);
-                        "已取消订阅高危告警推送。".to_string()
+                        Some("已取消订阅高危告警推送。".to_string())
                     } else {
-                        "当前未处于订阅状态。".to_string()
+                        Some("当前未处于订阅状态。".to_string())
                     }
                 } else {
                     info!(
@@ -931,23 +951,25 @@ async fn run_bot_actor(
                         persist_subscribers(&subscribers_path, &guard);
                     }
                     if matches!(lowered.as_str(), "/status" | "status") {
-                        format!(
+                        Some(format!(
                             "当前已订阅。订阅用户数：{}，已记录会话上下文数：{}",
                             guard.len(),
                             contexts.read().await.len()
-                        )
+                        ))
                     } else {
-                        "已接入 GAIA 高危告警推送。后续 WebUI 手动分析与定时分析会主动推送到微信。发送 /unsubscribe 可取消订阅，发送 /status 查看状态。".to_string()
+                        None
                     }
                 };
 
-                match bot.send(user_id.as_str(), reply.as_str()).await {
-                    Ok(_) => info!(
-                        "sent control reply to user_id={} reply_len={}",
-                        user_id,
-                        reply.len(),
-                    ),
-                    Err(err) => warn!("failed to send control reply to {user_id}: {err:#}"),
+                if let Some(reply) = reply {
+                    match bot.send(user_id.as_str(), reply.as_str()).await {
+                        Ok(_) => info!(
+                            "sent control reply to user_id={} reply_len={}",
+                            user_id,
+                            reply.len(),
+                        ),
+                        Err(err) => warn!("failed to send control reply to {user_id}: {err:#}"),
+                    }
                 }
             }
             BotCommand::TriggerAnalysis { source } => {
